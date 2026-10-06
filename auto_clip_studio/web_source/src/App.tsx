@@ -1211,7 +1211,7 @@ export default function App() {
     const rangeSuffix = (rangeStartSecs !== undefined || rangeEndSecs !== undefined)
       ? `_range_${rangeStartSecs ?? 0}_${rangeEndSecs ?? 'end'}`
       : '';
-    const manualSuffix = subtitlesSource === 'manual' ? '_manual' : '';
+    const manualSuffix = subtitlesSource === 'manual' ? '_manual_v2:' + Array.from(new Uint8Array(await crypto.subtle.digest('SHA-256', new TextEncoder().encode(manualSubtitlesContent)))).map(b => b.toString(16).padStart(2, '0')).join('') : '';
 
     // Determine target video identifier
     let targetAnalyzeUrl = sourceMode === 'gdrive' ? gdriveUrl.trim() : url.trim();
@@ -1274,7 +1274,7 @@ export default function App() {
 
     // Check localStorage cache first to avoid redundant API/Gemini processing (for YouTube URLs)
     if (sourceMode === 'youtube' && videoId) {
-      const promptSuffix = customPrompt.trim() ? `_prompt_${customPrompt.trim().replace(/[^a-zA-Z0-9]/g, '_')}` : '';
+      const promptSuffix = customPrompt.trim() ? `_prompt_v2:${encodeURIComponent(customPrompt.trim())}` : '';
       const modelSuffix = `_model_${selectedModel}`;
       const clipsSuffix = clipCountMode === 'auto' ? '_clips_auto' : `_clips_${targetClipCount}`;
       const cacheKey = `cheat_clip_cache_${videoId}_${durationPref}${modelSuffix}${clipsSuffix}${promptSuffix}${rangeSuffix}${manualSuffix}`;
@@ -1466,7 +1466,7 @@ export default function App() {
       // Cache the successful response safely (handling mobile Safari quota limits)
       if (resultData.video_id) {
         try {
-          const promptSuffix = customPrompt.trim() ? `_prompt_${customPrompt.trim().replace(/[^a-zA-Z0-9]/g, '_')}` : '';
+          const promptSuffix = customPrompt.trim() ? `_prompt_v2:${encodeURIComponent(customPrompt.trim())}` : '';
           const modelSuffix = `_model_${selectedModel}`;
           const clipsSuffix = clipCountMode === 'auto' ? '_clips_auto' : `_clips_${targetClipCount}`;
           const targetCacheKey = `cheat_clip_cache_${resultData.video_id}_${durationPref}${modelSuffix}${clipsSuffix}${promptSuffix}${rangeSuffix}${manualSuffix}`;

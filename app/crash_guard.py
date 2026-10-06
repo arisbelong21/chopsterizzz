@@ -48,9 +48,12 @@ def install_crash_guard() -> Path:
             except Exception:
                 pass
         try:
+            from PySide6.QtCore import QThread
             from PySide6.QtWidgets import QApplication, QMessageBox
             app = QApplication.instance()
-            if app is not None:
+            # threading.excepthook also calls report(); Qt widgets must only
+            # be created on the GUI thread. Worker exceptions are still logged.
+            if app is not None and QThread.currentThread() == app.thread():
                 msg = QMessageBox()
                 msg.setIcon(QMessageBox.Critical)
                 msg.setWindowTitle("Chopster — terjadi error")

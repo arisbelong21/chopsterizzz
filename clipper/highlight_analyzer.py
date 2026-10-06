@@ -8,6 +8,7 @@ from typing import Any
 
 from chopster.clipper.transcript_manager import Transcript
 from chopster.clipper.advanced_features import format_timecode
+from chopster.ai.schemas import validate_highlight
 
 # Heuristic keywords
 HOOK_PATTERNS = [r"\b(kenapa|mengapa|bagaimana|rahasia|jangan|ternyata|fakta|viral|menyesal|penting)\b", r"\b(wow|gila|luar biasa|mengejutkan|heboh)\b"]
@@ -149,7 +150,11 @@ def _parse_ai_candidates(resp_text: str, duration: float) -> list[Candidate]:
         if m:text=m.group(1)
     data=json.loads(text)
     if isinstance(data,list):
-        data={"highlights":data}
+        data={"candidates":data}
+    elif isinstance(data,dict) and "candidates" not in data and "highlights" in data:
+        # The visual review prompt uses `highlights`; the shared validator uses
+        # `candidates`. Normalize the envelope, never bypass field validation.
+        data={**data,"candidates":data["highlights"]}
     validated=validate_highlight(data,duration)
     return [Candidate(title=v["title"],start=v["start"],end=v["end"],excerpt=v["excerpt"],reason=v["reason"],hook=v["hook"],context_required=v["context_required"],weaknesses=v["weaknesses"],score=v["score"],source="ai") for v in validated]
 

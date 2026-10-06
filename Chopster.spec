@@ -1,6 +1,7 @@
 # -*- mode: python ; coding: utf-8 -*-
 """PyInstaller onedir build for the Chopster package layout in this folder."""
 from pathlib import Path
+import sys
 
 from PyInstaller.utils.hooks import collect_all, collect_data_files, collect_submodules
 
@@ -9,6 +10,10 @@ from PyInstaller.utils.hooks import collect_all, collect_data_files, collect_sub
 # Chopster package root; imports use the parent directory as their package root.
 ROOT = Path(SPECPATH).resolve()
 PARENT = ROOT.parent
+# Collection helpers run before Analysis(pathex=...). Make the canonical
+# source package importable before collecting its dynamically loaded modules.
+if str(PARENT) not in sys.path:
+    sys.path.insert(0, str(PARENT))
 
 
 def data_file(source: str, destination: str):

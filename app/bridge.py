@@ -14,7 +14,7 @@ import json
 import threading
 import logging
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from urllib.parse import parse_qs, unquote, urlparse
+from urllib.parse import parse_qs, urlparse
 
 from chopster.downloader.validators import valid_url
 
@@ -69,7 +69,7 @@ class BridgeHandler(BaseHTTPRequestHandler):
         if parsed.path == "/add":
             qs = parse_qs(parsed.query)
             url = (qs.get("url") or [""])[0]
-            self._accept(unquote(url))
+            self._accept(url)
             return
         self._json(404, {"ok": False, "error": "not found"})
 
@@ -88,7 +88,7 @@ class BridgeHandler(BaseHTTPRequestHandler):
         if parsed.path == "/add":
             if not url:
                 url = (parse_qs(parsed.query).get("url") or [""])[0]
-            self._accept(unquote(url))
+            self._accept(url)
             return
         self._json(404, {"ok": False, "error": "not found"})
 

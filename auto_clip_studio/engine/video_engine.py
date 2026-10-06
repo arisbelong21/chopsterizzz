@@ -2878,7 +2878,7 @@ def render_clip_to_mp4(
 
         sfx_vol = max(0.0, min(2.0, float(hook_sfx_volume)))
         filter_chains.append(
-            f"[{sfx_idx}:a]asetpts=PTS-STARTPTS,atrim=end={dur:.2f},volume={sfx_vol:.3f}[sfx_proc]"
+            f"[{sfx_idx}:a]asetpts=PTS-STARTPTS,atrim=end={dur:.2f},apad=whole_dur={dur:.2f},volume={sfx_vol:.3f}[sfx_proc]"
         )
         audio_inputs_to_mix.append("[sfx_proc]")
 

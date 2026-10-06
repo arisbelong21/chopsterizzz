@@ -37,7 +37,7 @@ FRAME_REMOTE_DOMAINS = {
 
 def _validate_frame_source(video_id: str, video_url: Optional[str]) -> None:
     """Allow known remote providers or an API URL to a local uploaded file only."""
-    if not video_id or not re.fullmatch(r"[A-Za-z0-9_-]{3,128}", video_id):
+    if not video_id or not re.fullmatch(r"[A-Za-z0-9_.-]{3,255}", video_id):
         raise HTTPException(status_code=400, detail="Invalid video_id")
     if not video_url:
         # IDs used by local uploads/Drive are not necessarily YouTube IDs.
@@ -84,6 +84,7 @@ async def _save_uploaded_file_chunked(file: UploadFile, save_path: Path, max_byt
     total_written = 0
     chunk_size = 1024 * 1024  # 1 MB
     try:
+        save_path.parent.mkdir(parents=True, exist_ok=True)
         with open(save_path, "wb") as f:
             while chunk := await file.read(chunk_size):
                 total_written += len(chunk)
@@ -419,13 +420,10 @@ async def detect_face(
     facecam_position: Optional[str] = "auto",
     streamer_preset: Optional[str] = "none"
 ):
-    """
+    """Detects speaker face coordinates and returns the frame URL."""
     _validate_frame_source(video_id, video_url)
     if not 0 <= timestamp <= 86400:
         raise HTTPException(status_code=400, detail="timestamp must be between 0 and 86400 seconds")
-    Detects speaker face coordinates (cx, cy, w, h) on the video at timestamp.
-    Returns normalized coordinates and the frame URL.
-    """
     is_streamer = (streamer_preset or "none") in ["split_top_cam", "pip_corner"]
     default_cx = 0.85 if is_streamer else 0.5
     default_cy = 0.78 if is_streamer else 0.35

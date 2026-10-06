@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import html, json, os, re, shutil, subprocess, time
 from pathlib import Path
+from copy import deepcopy
 
 from PySide6.QtCore import Qt, Signal, Slot, QUrl, QTimer, QEvent, QRect
 from PySide6.QtGui import QPixmap, QFont, QImage, QFontDatabase, QColor
@@ -116,6 +117,7 @@ class ClipperPage(QWidget):
         self.app=app; self.theme=theme; self.C=THEMES.get(theme,THEMES["dark"])
         self.setAcceptDrops(True)
         self.project=None; self.media=None; self.transcript=None; self.candidates=[]; self.clips=[]; self.focus_points=[]
+        self._project_generation=0; self._task_generations={}
         self._task_callbacks={}; self._task_errors={}; self._last_error=""; self._export_running=False
         self._subtitle_ready=False; self._subtitle_preview_time=None; self._preview_canvas_rect=None; self._fullscreen_preview=None; self._preview_muted=False; self._preview_volume=0.80
         self._acs_words_cache_owner=None; self._acs_words_cache=None
@@ -785,7 +787,7 @@ class ClipperPage(QWidget):
 
     def _set_source(self,path):
         try:
-            meta=probe(path); self.media=meta
+            meta=probe(path); self._project_generation+=1; self.media=meta
             # Reuse the persistent player instead of destroying/recreating it.
             try:
                 self.video_player.stop()
@@ -816,6 +818,7 @@ class ClipperPage(QWidget):
         except Exception: pass
 
     def _new_project(self):
+        self._project_generation+=1
         try:
             self.video_player.stop()
             self.video_player.setSource(QUrl())
@@ -833,9 +836,9 @@ class ClipperPage(QWidget):
         if dlg.exec() and lb.currentRow()>=0:self._load_project_obj(items[lb.currentRow()])
 
     def _load_project_obj(self,p):
-        self.project=p
         if not Path(p.source_path).exists():
             QMessageBox.warning(self,"Source hilang",f"Video tidak ditemukan:\n{p.source_path}"); return
+        self._project_generation+=1; self.project=p
         self._set_source_without_project(p.source_path)
         extra=p.extra or {}; self.clips=list(extra.get("clips",[])); self.focus_points=list(extra.get("focus_points",[])); self._scene_segments=list(extra.get("scene_segments",[]) or []); self._scene_preview_mode=bool(self._scene_segments); self.candidates=list(extra.get("candidates",[]))
         settings=extra.get("settings") or {}
@@ -934,6 +937,7 @@ class ClipperPage(QWidget):
     # -------------------------------------------------------------- tasks
     def _submit(self,tid,name,fn,callback):
         if self.app.tasks.is_active(tid): self.status.setText(f"{name} masih berjalan."); return False
+        self._task_generations[tid]=self._project_generation
         self._task_callbacks[tid]=callback
         self.app.tasks.submit(tid,name,fn)
         self.stat_status.set_value("Running"); self.progress.setValue(0)
@@ -943,6 +947,7 @@ class ClipperPage(QWidget):
         if tid=="clipper:scene" and hasattr(self,"scene_btn"): self.scene_btn.setEnabled(False)
         return True
     def _task_progress(self,tid,pct,msg):
+        if self._task_generations.get(tid) != self._project_generation:return
         if tid.startswith("clipper:"):
             self.progress.setValue(int(pct)); self.status.setText(msg)
             if tid == "clipper:scene":
@@ -961,16 +966,22 @@ class ClipperPage(QWidget):
                 except Exception:
                     pass
     def _task_result(self,tid,result):
+        if tid not in self._task_generations:return
+        current=self._task_generations.pop(tid)==self._project_generation
         cb=self._task_callbacks.pop(tid,None)
         if tid=="clipper:transcribe":
             self.transcribe_btn.setEnabled(True); self.transcribe_cancel_btn.setEnabled(False)
         if tid=="clipper:scene" and hasattr(self,"scene_btn"): self.scene_btn.setEnabled(True)
         if tid=="clipper:analyze" and hasattr(self,"analyze_btn"): self.analyze_btn.setEnabled(True)
+        if tid=="clipper:export": self.export_btn.setEnabled(True)
+        if not current:return
         if cb:
             try: cb(result)
             except Exception as e:self._log(f"ERROR: Callback: {e}")
         self.stat_status.set_value("Siap")
     def _task_failed(self,tid,error):
+        if tid not in self._task_generations:return
+        current=self._task_generations.pop(tid)==self._project_generation
         if tid=="clipper:transcribe":
             self.transcribe_btn.setEnabled(True); self.transcribe_cancel_btn.setEnabled(False)
         if tid=="clipper:scene" and hasattr(self,"scene_btn"): self.scene_btn.setEnabled(True)
@@ -978,6 +989,7 @@ class ClipperPage(QWidget):
         cb=self._task_errors.pop(tid,None)
         self._task_callbacks.pop(tid,None)
         if tid=="clipper:export": self.export_btn.setEnabled(True)
+        if not current:return
         self._last_error=error; self.stat_status.set_value("Gagal"); self.status.setText(f"Gagal: {error[:160]}"); self._log(f"ERROR: {error}")
     def _cancel_tasks(self): self.app.tasks.cancel_all("clipper:"); self.status.setText("Membatalkan...")
 
@@ -1018,6 +1030,7 @@ class ClipperPage(QWidget):
         from chopster.clipper.transcript_manager import Transcript
         model=self.model.currentText(); lang=self.lang.currentText(); wt=self.word_ts.isChecked(); path=self.project.source_path
         cfg=self._ai_config(); max_words=int(self.sub_max.value()); prep_sig=transcript_prepare_signature(cfg,max_words)
+        device=str(self.app.config.get("transcribe_device") or "auto")
 
         def source_label(src: str) -> str:
             return "AI Settings" if src == "settings-ai" else ("AI Settings + Local fallback" if src == "mixed" else "Local fallback")
@@ -1069,7 +1082,7 @@ class ClipperPage(QWidget):
             def prog(p,m):
                 if cancel_check(): raise RuntimeError("Dibatalkan")
                 signals.progress.emit("clipper:transcribe",int(p),m)
-            raw=transcribe(path,model=model,language=lang,device=str(self.app.config.get("transcribe_device") or "auto"),word_timestamps=wt,progress_cb=prog)
+            raw=transcribe(path,model=model,language=lang,device=device,word_timestamps=wt,progress_cb=prog)
             if cancel_check(): raise RuntimeError("Dibatalkan")
             signals.progress.emit("clipper:transcribe",92,"AI Transcript: merapikan hasil dan menyusun cue subtitle…")
             prepared, source = prepare_transcript_and_subtitles(raw, cfg, max_words_per_line=max_words)
@@ -1096,8 +1109,9 @@ class ClipperPage(QWidget):
         path=self.project.source_path; model=self.model.currentText(); lang=self.lang.currentText(); wt=self.word_ts.isChecked(); duration=float(self.media.duration)
         mode=self.reframe.currentText() if self.reframe.currentText() in ("Smart","AI Camera Director","Speaker Focus","Two Person") else "Smart"
         cfg=self._ai_config(); cfg["ai_camera_director"] = mode in ("Smart","AI Camera Director","Speaker Focus","Two Person"); cfg["target_aspect"] = self._preview_target_ratio()
+        project_path=self.project_dir(); target_aspect=cfg["target_aspect"]; device=str(self.app.config.get("transcribe_device") or "auto")
         def worker(*,signals,cancel_check):
-            return ensure_master_analysis(self.project_dir(),path,model=model,language=lang,word_timestamps=wt,device=str(self.app.config.get("transcribe_device") or "auto"),mode=mode,ai_config=cfg,progress_cb=lambda p,m: signals.progress.emit("clipper:master",p,m),cancel_check=cancel_check,force_camera=False,max_camera_samples=1800,target_aspect=self._preview_target_ratio())
+            return ensure_master_analysis(project_path,path,model=model,language=lang,word_timestamps=wt,device=device,mode=mode,ai_config=cfg,progress_cb=lambda p,m: signals.progress.emit("clipper:master",p,m),cancel_check=cancel_check,force_camera=False,max_camera_samples=1800,target_aspect=target_aspect)
         def done(res):
             if res.get("cancelled"): self.status.setText("Master Analysis dibatalkan."); return
             from chopster.clipper.transcript_manager import Transcript
@@ -1165,9 +1179,10 @@ class ClipperPage(QWidget):
                 config["master_camera_plan"] = master.get("ai_shots", [])
         except Exception:
             pass
+        transcript=deepcopy(self.transcript); duration=float(self.media.duration)
         def worker(*,signals,cancel_check):
             signals.progress.emit("clipper:analyze",8,"Analyzer: membaca seluruh transcript dari awal sampai akhir…")
-            result=analyze_with_ai(self.transcript,self.media.duration,config)
+            result=analyze_with_ai(transcript,duration,config)
             signals.progress.emit("clipper:analyze",96,"Analyzer: menyusun dan mengurutkan kandidat…")
             return result
         def done(c): self.candidates=c; self._render_highlights(); self.stat_high.set_value(str(len(c))); self._save_project(); self.status.setText(f"Analyzer selesai: {len(c)} kandidat dari seluruh timeline. Buka Viral Analyzer untuk preview.")
@@ -1221,13 +1236,16 @@ class ClipperPage(QWidget):
         if self.app.tasks.is_active("clipper:scene"):
             QMessageBox.information(self,"Scene Detect","Scene Detect masih berjalan."); return
         self.status.setText("Scene Detect + Gemini Camera: mencari cut, membaca frame, lalu membuat camera shot plan…"); self.progress.setValue(0)
-        cached_scenes=load_artifact(self.project_dir(),"scenes",self.project.source_path)
+        path=self.project.source_path; project_path=self.project_dir(); duration=float(self.media.duration)
+        source_aspect=float(self.media.width or 16)/max(1.0,float(self.media.height or 9))
+        target_aspect=self._preview_target_ratio(); tr=deepcopy(self.transcript); config=self._ai_config()
+        cached_scenes=load_artifact(project_path,"scenes",path)
         def worker(*,signals,cancel_check):
             segments=cached_scenes
             if segments is None:
                 def prog(p,m): signals.progress.emit("clipper:scene",min(40,int(p*0.40)),m)
-                segments=detect_scenes(self.project.source_path, progress_cb=prog, cancel_check=cancel_check)
-                save_artifact(self.project_dir(),"scenes",segments,self.project.source_path)
+                segments=detect_scenes(path, progress_cb=prog, cancel_check=cancel_check)
+                save_artifact(project_path,"scenes",segments,path)
             else:
                 signals.progress.emit("clipper:scene",8,"Scene cache ✓ — melewati scan FFmpeg")
             if cancel_check(): return {"cancelled":True}
@@ -1237,11 +1255,10 @@ class ClipperPage(QWidget):
             base_focus=[]; camera_evidence={}
             try:
                 from chopster.clipper.face_tracking import detect_face_focus
-                cfg=self._ai_config(); cfg["target_aspect"]=self._preview_target_ratio(); cfg["ai_camera_director"]=False
+                cfg=deepcopy(config); cfg["target_aspect"]=target_aspect; cfg["ai_camera_director"]=False
                 signals.progress.emit("clipper:scene",45,"Person/Face tracking — menyiapkan subject map…")
-                tr=self.transcript
                 base_focus=detect_face_focus(
-                    self.project.source_path,0.0,float(self.media.duration),1.0,1800,
+                    path,0.0,duration,1.0,1800,
                     mode="AI Camera Director", transcript=tr, ai_config=cfg, evidence_out=camera_evidence,
                     progress_cb=lambda p,m: signals.progress.emit("clipper:scene", min(57, 45 + int(max(0,min(100,p))*0.12)), m),
                 )
@@ -1255,17 +1272,17 @@ class ClipperPage(QWidget):
             vision={}
             try:
                 from chopster.ai.orchestrator import orchestrator_from_config
-                cfg=self._ai_config(); cfg["target_aspect"]=self._preview_target_ratio()
+                cfg=deepcopy(config); cfg["target_aspect"]=target_aspect
                 orch=orchestrator_from_config(cfg)
                 vision=analyze_scene_visuals(
-                    orch,self.project.source_path,segments,
-                    target_aspect=self._preview_target_ratio(),max_scenes=24,
+                    orch,path,segments,
+                    target_aspect=target_aspect,max_scenes=24,
                     timeout=min(60,int(cfg.get("ai_timeout") or 45)),
                     camera_timeline=camera_evidence.get("timeline") or [],
                 )
             except Exception as exc:
-                vision={"source":"local-fallback","scenes":[],"error":str(exc)[:500],"target_aspect":self._preview_target_ratio()}
-            save_artifact(self.project_dir(),"scene_vision",vision,self.project.source_path)
+                vision={"source":"local-fallback","scenes":[],"error":str(exc)[:500],"target_aspect":target_aspect}
+            save_artifact(project_path,"scene_vision",vision,path)
             if cancel_check(): return {"cancelled":True}
 
             # Use the same representative frames for a frame-by-frame Gemini camera
@@ -1277,13 +1294,13 @@ class ClipperPage(QWidget):
                 from chopster.ai.orchestrator import orchestrator_from_config
                 from chopster.clipper.visual_analyzer import select_visual_timestamps, extract_frame_images
                 from chopster.clipper.camera_director import ai_camera_director_visual, apply_ai_shots, stabilize_camera_path
-                cfg=self._ai_config(); cfg["target_aspect"]=self._preview_target_ratio(); cfg["ai_camera_director"]=True
+                cfg=deepcopy(config); cfg["target_aspect"]=target_aspect; cfg["ai_camera_director"]=True
                 orch=orchestrator_from_config(cfg)
                 timeline=camera_evidence.get("timeline") or []
-                timestamps=select_visual_timestamps(self.project.source_path, scenes=segments, camera_timeline=timeline, max_frames=12, duration=float(self.media.duration))
+                timestamps=select_visual_timestamps(path, scenes=segments, camera_timeline=timeline, max_frames=12, duration=duration)
                 root=None; imgs=[]
                 try:
-                    root,imgs=extract_frame_images(self.project.source_path,timestamps,max_width=720)
+                    root,imgs=extract_frame_images(path,timestamps,max_width=720)
                     signals.progress.emit("clipper:scene",78,f"Gemini Camera Director — {len(imgs)} frame representatif…")
                     ai_shots=ai_camera_director_visual(
                         orch,timeline," ".join(getattr(s,"text","") for s in getattr(tr,"segments",[]) or []),
@@ -1295,8 +1312,8 @@ class ClipperPage(QWidget):
                 if ai_shots:
                     focus_dicts=apply_ai_shots(
                         focus_dicts,ai_shots,timeline=timeline,
-                        source_aspect=float(self.media.width or 16)/max(1.0,float(self.media.height or 9)),
-                        target_aspect=self._preview_target_ratio(),
+                        source_aspect=source_aspect,
+                        target_aspect=target_aspect,
                     )
                     focus_dicts=stabilize_camera_path(focus_dicts,min_shot_duration=1.5,transition_duration=.28,max_speed=.48,max_step=.10)
                 else:
@@ -1305,19 +1322,19 @@ class ClipperPage(QWidget):
                     if local_shots:
                         focus_dicts=apply_ai_shots(
                             focus_dicts,local_shots,timeline=timeline,
-                            source_aspect=float(self.media.width or 16)/max(1.0,float(self.media.height or 9)),
-                            target_aspect=self._preview_target_ratio(),
+                            source_aspect=source_aspect,
+                            target_aspect=target_aspect,
                         )
                         focus_dicts=stabilize_camera_path(focus_dicts,min_shot_duration=2.0,transition_duration=.28,max_speed=.48,max_step=.10)
                         ai_shots=local_shots
             except Exception as exc:
                 camera_evidence.setdefault("ai_errors",[]).append(f"Gemini Camera Director: {str(exc)[:350]}")
-            save_artifact(self.project_dir(),"camera",{
-                "points":focus_dicts,"target_aspect":float(self._preview_target_ratio()),"mode":"AI Camera Director",
+            save_artifact(project_path,"camera",{
+                "points":focus_dicts,"target_aspect":float(target_aspect),"mode":"AI Camera Director",
                 "timeline":camera_evidence.get("timeline") or [],"ai_shots":ai_shots,
                 "sample_step":camera_evidence.get("sample_step"),
                 "camera_algorithm_version":"8.5.0",
-            },self.project.source_path)
+            },path)
             if cancel_check(): return {"cancelled":True}
             signals.progress.emit("clipper:scene",100,"Scene Detect + Gemini Vision + Camera Director selesai")
             return {"segments":segments,"vision":vision,"focus":focus_dicts,"camera_evidence":camera_evidence,"used_cache":cached_scenes is not None,"ai_shots":ai_shots}
@@ -1525,9 +1542,10 @@ class ClipperPage(QWidget):
         if not self.transcript or not self.project:
             QMessageBox.information(self,"AI Subtitle","Jalankan Transcribe terlebih dahulu."); return
         self._sync_transcript_from_table(); cfg=self._ai_config()
+        transcript=deepcopy(self.transcript); max_words=int(self.sub_max.value())
         def worker(*,signals,cancel_check):
             signals.progress.emit("clipper:subtitle_ai",8,"AI Subtitle: merapikan transcript dan menyusun cue…")
-            tr, source=prepare_transcript_and_subtitles(self.transcript,cfg,max_words_per_line=int(self.sub_max.value()))
+            tr, source=prepare_transcript_and_subtitles(transcript,cfg,max_words_per_line=max_words)
             if cancel_check(): raise RuntimeError("Dibatalkan")
             signals.progress.emit("clipper:subtitle_ai",96,"AI Subtitle: menyimpan hasil transcript + cue…")
             return {"transcript":tr.to_dict(),"source":source}
@@ -1556,14 +1574,16 @@ class ClipperPage(QWidget):
         mode=self.reframe.currentText() if self.reframe.currentText() in ("Smart","AI Camera Director","Speaker Focus","Two Person") else "Smart"
         cfg=self._ai_config(); cfg["ai_camera_director"] = mode in ("Smart","AI Camera Director","Speaker Focus","Two Person"); cfg["target_aspect"] = self._preview_target_ratio()
         self.status.setText("Detecting people/faces — camera locks stable subjects and uses AI only for editorial shot decisions.")
+        path=self.project.source_path; project_path=self.project_dir(); duration=float(self.media.duration)
+        transcript=deepcopy(self.transcript); target_aspect=cfg["target_aspect"]
         def worker(*,signals,cancel_check):
             def run():
-                return detect_face_focus(self.project.source_path,0,self.media.duration,0.9,1800,mode,self.transcript,cfg)
+                return detect_face_focus(path,0,duration,0.9,1800,mode,transcript,cfg)
             pts=run()
             return [p.__dict__ for p in pts]
         def done(pts):
             self.focus_points=pts; self._preview_quick_focus=[]
-            try: save_artifact(self.project_dir(),"camera",{"points":pts,"target_aspect":self._preview_target_ratio(),"mode":mode,"camera_algorithm_version":"8.5.0"},self.project.source_path)
+            try: save_artifact(project_path,"camera",{"points":pts,"target_aspect":target_aspect,"mode":mode,"camera_algorithm_version":"8.5.0"},path)
             except Exception: pass
             self._save_project(); self._render_preview_frame(); self.status.setText(f"Face / Person Tracking selesai: {len(pts)} locked camera points. Semua aspect ratio sekarang memakai metadata subject-safe.")
         self._submit("clipper:faces","Person + Face Tracking",worker,done)
@@ -1599,7 +1619,7 @@ class ClipperPage(QWidget):
                 c["master_context"] = {}
                 c["master_camera_plan"] = []
         c["speaker_diarization_enabled"] = bool(c.get("speaker_diarization_enabled", False))
-        return c
+        return deepcopy(c)
     def _generate_captions(self):
         if not self.transcript:
             QMessageBox.information(self,"Content Pack","Jalankan Transcribe atau Master Analysis terlebih dahulu.")
@@ -1610,9 +1630,10 @@ class ClipperPage(QWidget):
             context.append({"start":float(d.get("start",0)),"end":float(d.get("end",0)),"score":int(d.get("score",0)),"title":str(d.get("title", "")),"hook":str(d.get("hook", "")),"reason":str(d.get("reason", "")),"excerpt":str(d.get("excerpt", ""))})
         cfg=self._ai_config(); cfg["highlight_context"]=context
         platform=self.pub_platform.currentText(); language=self.lang.currentText() if self.lang.currentText()!="auto" else "id"
+        transcript=deepcopy(self.transcript)
         def worker(*,signals,cancel_check):
             signals.progress.emit("clipper:captions",10,"Content Pack: menyusun title options + description + SEO…")
-            return generate_captions(self.transcript,cfg,platform=platform,language=language,count=5,style="hooks")
+            return generate_captions(transcript,cfg,platform=platform,language=language,count=5,style="hooks")
         def done(d):
             titles=d.get("titles") or ([d.get("title")] if d.get("title") else [])
             caps=d.get("captions") or []
@@ -1666,13 +1687,13 @@ class ClipperPage(QWidget):
         if not text:
             QMessageBox.information(self,"Voiceover","Masukkan caption atau jalankan transcript terlebih dahulu."); return
         out=self.project_dir()/"exports"/"voiceover.wav" if self.project else Path.home()/"voiceover.wav"
-        cfg=self._ai_config()
+        cfg=self._ai_config(); language=self.lang.currentText()
         def worker(*,signals,cancel_check):
             signals.progress.emit("clipper:voiceover",10,"Voiceover: menyiapkan naskah…")
             script=text
             try:
                 from chopster.ai.content_tools import generate_voiceover_script
-                script=generate_voiceover_script(text,cfg,language=self.lang.currentText())
+                script=generate_voiceover_script(text,cfg,language=language)
                 signals.progress.emit("clipper:voiceover",45,"Voiceover: naskah AI siap, membuat audio lokal…")
             except Exception as exc:
                 signals.progress.emit("clipper:voiceover",35,f"Voiceover: AI gagal, lanjut lokal ({str(exc)[:100]})")
@@ -1729,7 +1750,11 @@ class ClipperPage(QWidget):
         wm_text=self.wm_text.text().strip() if self.wm_enable.isChecked() and self.wm_type.currentText()=="Text" else None
         wm_img=self.wm_image.text().strip() if self.wm_enable.isChecked() and self.wm_type.currentText()=="Image" else None
         # convert focus plan to clip-relative coordinates
-        fp=focus
+        fp=deepcopy(focus); chosen=deepcopy(chosen)
+        path=self.project.source_path; quality=self.quality.currentText(); aspect=self.aspect.currentText().lower()
+        parallel=int(self.app.config.get("export_parallel") or 1)
+        watermark_position=self.wm_pos.currentText(); watermark_opacity=self.wm_op.value()
+        watermark_font_size=self.wm_size.value(); watermark_scale=float(self.wm_img_size.value())/100.0
         self.export_btn.setEnabled(False)
         self.status.setText(f"Export dimulai — {len(chosen)} clip ke {out}")
         errors=[]
@@ -1741,7 +1766,7 @@ class ClipperPage(QWidget):
                 signals.progress.emit("clipper:export",pct,f"Clip {idx}: {state}" if int(idx)>0 else state)
                 if "Gagal:" in state:
                     errors.append(f"Clip {idx} ({title}): {state}")
-            ok,fail=export_batch(self.project.source_path,chosen,out,self.quality.currentText(),self.aspect.currentText().lower(),cancel_flag=cancel_check,on_progress=prog,on_clip=clip_cb,parallel=int(self.app.config.get("export_parallel") or 1),burn_subtitle=burn,watermark_text=wm_text,watermark_image=wm_img,watermark_position=self.wm_pos.currentText(),watermark_opacity=self.wm_op.value(),watermark_font_size=self.wm_size.value(),watermark_scale=float(self.wm_img_size.value())/100.0,focus_points=fp,audio_filter=audio_filter)
+            ok,fail=export_batch(path,chosen,out,quality,aspect,cancel_flag=cancel_check,on_progress=prog,on_clip=clip_cb,parallel=parallel,burn_subtitle=burn,watermark_text=wm_text,watermark_image=wm_img,watermark_position=watermark_position,watermark_opacity=watermark_opacity,watermark_font_size=watermark_font_size,watermark_scale=watermark_scale,focus_points=fp,audio_filter=audio_filter)
             return ok,fail,str(out),list(errors)
         def done(res):
             ok,fail,folder,errs=res
@@ -2382,9 +2407,10 @@ class ClipperPage(QWidget):
         analysis_mode=self.reframe.currentText() if self.reframe.currentText() in ("Smart","AI Camera Director","Speaker Focus","Two Person") else "Smart"
         config["ai_camera_director"] = analysis_mode in ("Smart","AI Camera Director","Speaker Focus","Two Person")
         config["target_aspect"] = self._preview_target_ratio()
+        project_path=self.project_dir(); target_aspect=config["target_aspect"]; device=str(self.app.config.get("transcribe_device") or "auto")
         def worker(*,signals,cancel_check):
             signals.progress.emit("clipper:smart",2,"Auto Create Shorts — cek Master Analysis cache…")
-            analysis=ensure_master_analysis(self.project_dir(),path,model=model,language=lang,word_timestamps=wt,device=str(self.app.config.get("transcribe_device") or "auto"),mode=analysis_mode,ai_config=config,progress_cb=lambda p,m: signals.progress.emit("clipper:smart",min(68,p),m),cancel_check=cancel_check,max_camera_samples=1800,target_aspect=self._preview_target_ratio())
+            analysis=ensure_master_analysis(project_path,path,model=model,language=lang,word_timestamps=wt,device=device,mode=analysis_mode,ai_config=config,progress_cb=lambda p,m: signals.progress.emit("clipper:smart",min(68,p),m),cancel_check=cancel_check,max_camera_samples=1800,target_aspect=target_aspect)
             if analysis.get("cancelled"): return analysis
             from chopster.clipper.transcript_manager import Transcript
             tr=Transcript.from_dict(analysis["transcript"])
@@ -2393,10 +2419,10 @@ class ClipperPage(QWidget):
                 "ai_advice": master.get("ai_advice", {}) if isinstance(master, dict) else {},
                 "visual_review": master.get("visual_review", {}) if isinstance(master, dict) else {},
                 "camera_plan": master.get("ai_shots", []) if isinstance(master, dict) else [],
-                "target_aspect": master.get("target_aspect") if isinstance(master, dict) else self._preview_target_ratio(),
+                "target_aspect": master.get("target_aspect") if isinstance(master, dict) else target_aspect,
             }
             config["master_camera_plan"] = master.get("ai_shots", []) if isinstance(master, dict) else []
-            config["target_aspect"] = self._preview_target_ratio()
+            config["target_aspect"] = target_aspect
             signals.progress.emit("clipper:smart",72,"Auto Create Shorts — AI Editor Brain menilai kandidat berdasarkan Master Analysis…")
             cands=analyze_with_ai(tr,total_duration,config)
             if cancel_check(): return {"cancelled":True}

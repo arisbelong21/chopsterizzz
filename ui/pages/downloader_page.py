@@ -649,6 +649,9 @@ class DownloaderPage(QWidget):
         except Exception: pass
         self.queue.setRowCount(0)
         self._errors.clear()
+        # Create rows on the GUI thread before download workers emit updates.
+        for i, url in enumerate(urls, 1):
+            self._add_row(i, detect_platform(url), url, "-", "Menunggu")
         self._pending_urls = urls
         self._set_running(True)
         self.progress.setValue(0)
@@ -677,10 +680,7 @@ class DownloaderPage(QWidget):
                 self.sig_progress.emit(int(pct), str(msg))
 
             def on_row(no: int, plat: str, title: str, status: str):
-                if status == "Menunggu":
-                    self.sig_row_add.emit(int(no), str(plat), str(title), "-", str(status))
-                else:
-                    self.sig_row_update.emit(int(no), str(plat), str(title), str(status))
+                self.sig_row_update.emit(int(no), str(plat), str(title), str(status))
 
             def on_log(msg: str):
                 self.sig_download_log.emit(str(msg))

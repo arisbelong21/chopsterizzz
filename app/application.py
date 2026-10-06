@@ -75,6 +75,9 @@ class Application:
     def shutdown(self) -> None:
         if self._shutdown_done:
             return
+        # Workers can still emit progress and use config/database during cancel.
+        # Never tear down these dependencies before the pool has drained.
+        self.tasks.shutdown()
         self._shutdown_done = True
         try:
             if self._bridge is not None:

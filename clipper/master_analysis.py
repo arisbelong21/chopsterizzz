@@ -419,7 +419,7 @@ def ensure_master_analysis(
             root=None; imgs=[]
             try:
                 root, imgs = extract_frame_images(path, timestamps, max_width=560)
-                from chopster.clipper.camera_director import ai_camera_director_visual, apply_ai_shots
+                from chopster.clipper.camera_director import ai_camera_director_visual, apply_ai_shots, stabilize_camera_path
                 from chopster.ai.orchestrator import orchestrator_from_config
                 orch=orchestrator_from_config(ai_config)
                 ai_shots=ai_camera_director_visual(orch, evidence.get("timeline") or [], " ".join(getattr(s,"text","") for s in tr.segments), [str(x) for x in imgs], timestamps, visual_context=visual_review or {})

@@ -2,6 +2,8 @@
 from __future__ import annotations
 
 import sqlite3
+import threading
+from functools import wraps
 import time
 from pathlib import Path
 from typing import Any
@@ -52,8 +54,18 @@ CREATE INDEX IF NOT EXISTS idx_clips_project ON clipper_clips(project_id);
 """
 
 
+def _serialized(method):
+    """Keep each operation on the shared SQLite connection atomic across workers."""
+    @wraps(method)
+    def locked(self, *args, **kwargs):
+        with self._lock:
+            return method(self, *args, **kwargs)
+    return locked
+
+
 class Database:
     def __init__(self, path: Path | None = None) -> None:
+        self._lock = threading.RLock()
         self.path = path or (user_data_dir() / "chopster.db")
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self._conn = sqlite3.connect(str(self.path), check_same_thread=False)
@@ -65,6 +77,7 @@ class Database:
         # migrate legacy history.json if db empty
         self._migrate_legacy()
 
+    @_serialized
     def _migrate_legacy(self) -> None:
         cur = self._conn.execute("SELECT COUNT(*) FROM download_history")
         if cur.fetchone()[0] > 0:
@@ -93,6 +106,7 @@ class Database:
 
     # -- history ----------------------------------------------------
 
+    @_serialized
     def add_history(self, url: str, platform: str = "", title: str = "",
                     status: str = "", file_path: str = "", file_size: int = 0,
                     format_sel: str = "", error: str = "") -> int:
@@ -107,6 +121,7 @@ class Database:
         self._conn.commit()
         return cur.lastrowid  # type: ignore
 
+    @_serialized
     def list_history(self, limit: int = 500, search: str = "", platform: str = "", status: str = "") -> list[dict[str, Any]]:
         q = "SELECT * FROM download_history WHERE 1=1"
         params: list[Any] = []
@@ -125,20 +140,24 @@ class Database:
         rows = self._conn.execute(q, params).fetchall()
         return [dict(r) for r in rows]
 
+    @_serialized
     def delete_history(self, hid: int) -> None:
         self._conn.execute("DELETE FROM download_history WHERE id=?", (hid,))
         self._conn.commit()
 
+    @_serialized
     def clear_history(self) -> None:
         self._conn.execute("DELETE FROM download_history")
         self._conn.commit()
 
+    @_serialized
     def has_url(self, url: str) -> bool:
         cur = self._conn.execute("SELECT 1 FROM download_history WHERE url=? LIMIT 1", (url,))
         return cur.fetchone() is not None
 
     # -- projects ---------------------------------------------------
 
+    @_serialized
     def upsert_project(self, pid: str, name: str, source_path: str = "", source_meta: str = "", settings: str = "") -> None:
         import datetime
         now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -152,19 +171,23 @@ class Database:
         )
         self._conn.commit()
 
+    @_serialized
     def list_projects(self) -> list[dict[str, Any]]:
         rows = self._conn.execute("SELECT * FROM clipper_projects ORDER BY ts DESC").fetchall()
         return [dict(r) for r in rows]
 
+    @_serialized
     def get_project(self, pid: str) -> dict[str, Any] | None:
         cur = self._conn.execute("SELECT * FROM clipper_projects WHERE id=?", (pid,))
         row = cur.fetchone()
         return dict(row) if row else None
 
+    @_serialized
     def delete_project(self, pid: str) -> None:
         self._conn.execute("DELETE FROM clipper_projects WHERE id=?", (pid,))
         self._conn.commit()
 
+    @_serialized
     def close(self) -> None:
         try:
             self._conn.close()

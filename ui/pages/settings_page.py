@@ -636,15 +636,21 @@ class SettingsPage(QWidget):
         model = (self.ai_manual_model.text().strip() if hasattr(self, "ai_manual_model") and self.ai_manual_model.text().strip() else str(self.app.config.get("ai_model") or ""))
         return model or ""
 
-    def _build_provider(self, endpoint: str, key: str, timeout: int, manual_model: str = "", vision_model: str = ""):
+    def _ai_provider_factory(self, endpoint: str, key: str, timeout: int, manual_model: str = "", vision_model: str = ""):
+        # Resolve UI/config values on the GUI thread; construct in the worker.
         provider = self._ai_provider_value()
         manual_model = manual_model or str(self.app.config.get("ai_model") or "")
         vision_model = vision_model or str(self.app.config.get("ai_vision_model") or "")
-        if provider == "google":
-            from chopster.ai.google_gemini import GoogleGeminiProvider
-            return GoogleGeminiProvider(api_key=key, model=manual_model, timeout=timeout)
-        from chopster.ai.api_provider import APIProvider
-        return APIProvider(endpoint, key, manual_model, timeout, vision_model)
+        def build():
+            if provider == "google":
+                from chopster.ai.google_gemini import GoogleGeminiProvider
+                return GoogleGeminiProvider(api_key=key, model=manual_model, timeout=timeout)
+            from chopster.ai.api_provider import APIProvider
+            return APIProvider(endpoint, key, manual_model, timeout, vision_model)
+        return build
+
+    def _build_provider(self, endpoint: str, key: str, timeout: int, manual_model: str = "", vision_model: str = ""):
+        return self._ai_provider_factory(endpoint, key, timeout, manual_model, vision_model)()
 
     def _provider_from_fields(self):
         return self._build_provider(self.ai_endpoint.text().strip(), self.ai_key.text().strip(), int(self.ai_timeout.value()))
@@ -669,10 +675,12 @@ class SettingsPage(QWidget):
             sig = (provider, endpoint, key)
         if getattr(self, "_last_ai_signature", None) == sig and getattr(self, "ai_models_cache", None):
             return
-        self._last_ai_signature = sig
-        self._test_ai_connection(auto=True)
+        if self._test_ai_connection(auto=True):
+            self._last_ai_signature = sig
 
     def _test_ai_connection(self, auto: bool = False):
+        if self._ai_task_pending("settings:ai_connect"):
+            return False
         provider=self._ai_provider_value()
         endpoint=self.ai_endpoint.text().strip(); key=self.ai_key.text().strip(); timeout=int(self.ai_timeout.value())
         if provider == "google":
@@ -691,8 +699,9 @@ class SettingsPage(QWidget):
         if manual_model:
             self.app.config.set("ai_model", manual_model)
         vision_model=str(self.ai_vision_model.text().strip()) if hasattr(self,"ai_vision_model") else str(self.app.config.get("ai_vision_model") or "")
+        build_provider = self._ai_provider_factory(endpoint,key,timeout,manual_model,vision_model)
         def worker(*,signals,cancel_check):
-            return self._build_provider(endpoint,key,timeout,manual_model,vision_model).connection_probe(manual_model)
+            return build_provider().connection_probe(manual_model)
         def done(result):
             models=list(result.get("models") or [])
             if models:
@@ -710,17 +719,7 @@ class SettingsPage(QWidget):
             try:self.app.config.save()
             except Exception:pass
             self.ai_test_btn.setEnabled(True); self.ai_refresh_btn.setEnabled(True); self.ai_settings_changed.emit()
-        def failed(tid,error):
-            self.ai_status.setText(f"⚠️ AI REMOTE OFFLINE: {error[:220]} • LOCAL FALLBACK SIAP")
-            self.app.config.set("ai_last_connection", "degraded_remote")
-            self.ai_test_btn.setEnabled(True); self.ai_refresh_btn.setEnabled(True)
-        self._ai_task_callbacks=getattr(self,"_ai_task_callbacks",{})
-        self._ai_task_callbacks["settings:ai_connect"]=done
-        if not hasattr(self,"_ai_task_hooked"):
-            self._ai_task_hooked=True
-            self.app.tasks.task_result.connect(self._on_ai_task_result)
-            self.app.tasks.task_failed.connect(self._on_ai_task_failed)
-        self.app.tasks.submit("settings:ai_connect","AI Connection",worker)
+        return self._submit_ai_task("settings:ai_connect","AI Connection",worker,done)
 
     def _verified_vision_model_count(self, models) -> int:
         try:
@@ -759,6 +758,8 @@ class SettingsPage(QWidget):
         return ""
 
     def _test_ai_vision(self):
+        if self._ai_task_pending("settings:ai_vision"):
+            return False
         provider=self._ai_provider_value()
         endpoint=self.ai_endpoint.text().strip(); key=self.ai_key.text().strip(); timeout=int(self.ai_timeout.value())
         if not self._ai_fields_configured():
@@ -768,6 +769,7 @@ class SettingsPage(QWidget):
         manual_model=str(self.ai_manual_model.text().strip()) if hasattr(self,"ai_manual_model") and self.ai_manual_model.text().strip() else str(self.app.config.get("ai_model") or "")
         vision_model=str(self.ai_vision_model.text().strip()) if hasattr(self,"ai_vision_model") and self.ai_vision_model.text().strip() else (manual_model or "")
         probe_model = self._selected_ai_probe_model(vision_model)
+        build_provider = self._ai_provider_factory(endpoint,key,timeout,manual_model,vision_model)
         def worker(*,signals,cancel_check):
             import tempfile
             from pathlib import Path
@@ -779,7 +781,7 @@ class SettingsPage(QWidget):
             im=Image.new("RGB",(96,96),(238,238,238))
             d=ImageDraw.Draw(im); d.rectangle((8,8,88,88),outline=(20,20,20),width=3); d.text((18,40),"CHOPSTER",fill=(10,10,10))
             im.save(img)
-            p=self._build_provider(endpoint,key,timeout,manual_model,vision_model)
+            p=build_provider()
             probe_options = {"allow_unverified": True} if provider == "gateway" else {}
             resp=p.generate_vision(
                 'Balas JSON saja: {"ok":true,"description":"jelaskan gambar secara singkat"}.',
@@ -803,13 +805,7 @@ class SettingsPage(QWidget):
                 self.ai_status.setText("⚠️ Vision remote belum berhasil diverifikasi. Tugas visual memakai Local Vision/Tracking.")
             self._refresh_ai_visual_status()
             self.ai_vision_btn.setEnabled(True)
-        self._ai_task_callbacks=getattr(self,"_ai_task_callbacks",{})
-        self._ai_task_callbacks["settings:ai_vision"]=done
-        if not hasattr(self,"_ai_task_hooked"):
-            self._ai_task_hooked=True
-            self.app.tasks.task_result.connect(self._on_ai_task_result)
-            self.app.tasks.task_failed.connect(self._on_ai_task_failed)
-        self.app.tasks.submit("settings:ai_vision","AI Vision Test",worker)
+        return self._submit_ai_task("settings:ai_vision","AI Vision Test",worker,done)
 
     def _record_vision_test(self, model_id: str, verified: bool, *, provider: str | None = None, endpoint: str | None = None):
         """Persist a safe vision result in the matching provider/endpoint scope."""
@@ -839,22 +835,26 @@ class SettingsPage(QWidget):
         self.ai_models_cache = cache
 
     def _test_embedded_gemini_vision(self):
+        if self._ai_task_pending("settings:embedded_gemini_vision"):
+            return False
+        provider=self._ai_provider_value()
+        endpoint=self.ai_endpoint.text().strip(); key=self.ai_key.text().strip(); timeout=int(self.ai_timeout.value())
+        configured = self._ai_fields_configured()
+        manual_model=str(self.ai_manual_model.text().strip()) if hasattr(self,"ai_manual_model") and self.ai_manual_model.text().strip() else str(self.app.config.get("ai_model") or "")
+        vision_model=str(self.ai_vision_model.text().strip()) if hasattr(self,"ai_vision_model") and self.ai_vision_model.text().strip() else (manual_model or "")
+        vision_model = self._selected_ai_probe_model(vision_model)
+        build_provider = self._ai_provider_factory(endpoint,key,timeout,manual_model,vision_model)
         self.ai_embedded_test_btn.setEnabled(False)
         self.ai_status.setText("⏳ Menguji AI Vision (global) dengan frame uji kecil…")
         def worker(*,signals,cancel_check):
             import tempfile
             from pathlib import Path
             from PIL import Image, ImageDraw
-            provider=self._ai_provider_value()
-            endpoint=self.ai_endpoint.text().strip(); key=self.ai_key.text().strip(); timeout=int(self.ai_timeout.value())
-            if not self._ai_fields_configured():
+            if not configured:
                 raise RuntimeError("AI belum dikonfigurasi (set provider, isi API key; untuk Gateway juga Base URL). Visual akan memakai Local Vision/Tracking.")
-            manual_model=str(self.ai_manual_model.text().strip()) if hasattr(self,"ai_manual_model") and self.ai_manual_model.text().strip() else str(self.app.config.get("ai_model") or "")
-            vision_model=str(self.ai_vision_model.text().strip()) if hasattr(self,"ai_vision_model") and self.ai_vision_model.text().strip() else (manual_model or "")
-            vision_model = self._selected_ai_probe_model(vision_model)
             img=Path(tempfile.gettempdir())/"chopster_embedded_gemini_probe.png"
             im=Image.new("RGB",(320,200),(38,44,58)); d=ImageDraw.Draw(im); d.rectangle((70,45,250,155),outline=(255,190,34),width=4); d.text((85,85),"CHOPSTER",fill=(255,255,255)); im.save(img)
-            p=self._build_provider(endpoint,key,timeout,manual_model,vision_model)
+            p=build_provider()
             probe_options = {"allow_unverified": True} if provider == "gateway" else {}
             r=p.generate_vision("Jelaskan singkat isi frame ini dan apakah komposisinya aman untuk video portrait. Balas maksimal 3 kalimat.",[str(img)],model=vision_model or manual_model,max_tokens=600,timeout=min(60,timeout),**probe_options)
             raw=r.raw if isinstance(r.raw,dict) else {}
@@ -868,56 +868,99 @@ class SettingsPage(QWidget):
         def fail(tid,error):
             self.ai_status.setText(f"⚠️ AI Vision (global) belum tersedia: {str(error)[:260]} • Local Vision/Tracking tetap siap")
             self.ai_embedded_test_btn.setEnabled(True)
-        self._ai_task_callbacks=getattr(self,"_ai_task_callbacks",{})
-        self._ai_task_callbacks["settings:embedded_gemini_vision"]=done
-        self._ai_task_callbacks_fail=getattr(self,"_ai_task_callbacks_fail",{})
-        self._ai_task_callbacks_fail["settings:embedded_gemini_vision"]=fail
-        if not hasattr(self,"_ai_task_hooked"):
-            self._ai_task_hooked=True
-            self.app.tasks.task_result.connect(self._on_ai_task_result)
-            self.app.tasks.task_failed.connect(self._on_ai_task_failed)
-        self.app.tasks.submit("settings:embedded_gemini_vision","AI Vision Test (global)",worker)
+        return self._submit_ai_task("settings:embedded_gemini_vision","AI Vision Test (global)",worker,done,fail)
 
     def _test_ai_inference(self):
+        if self._ai_task_pending("settings:ai_infer"):
+            return False
         endpoint=self.ai_endpoint.text().strip(); key=self.ai_key.text().strip(); model=(str(self.ai_manual_model.text().strip()) if hasattr(self,"ai_manual_model") and self.ai_manual_model.text().strip() else str(self.app.config.get("ai_model") or "")); timeout=int(self.ai_timeout.value())
         if not self._ai_fields_configured():
             QMessageBox.information(self,"Test AI","Hubungkan AI terlebih dahulu."); return
+        build_provider = self._ai_provider_factory(endpoint,key,timeout,model)
         def worker(*,signals,cancel_check):
-            p=self._build_provider(endpoint,key,timeout,model)
+            p=build_provider()
             return p.test_inference(model or None)
         def done(resp): self.ai_status.setText(f"✅ AI merespons • {resp.text[:80] or 'OK'}")
-        self._ai_task_callbacks=getattr(self,"_ai_task_callbacks",{})
-        self._ai_task_callbacks["settings:ai_infer"]=done
-        if not hasattr(self,"_ai_task_hooked"):
-            self._ai_task_hooked=True; self.app.tasks.task_result.connect(self._on_ai_task_result); self.app.tasks.task_failed.connect(self._on_ai_task_failed)
-        self.app.tasks.submit("settings:ai_infer","AI Inference Test",worker)
+        return self._submit_ai_task("settings:ai_infer","AI Inference Test",worker,done)
+
+    def _ai_task_signature(self):
+        model = self._selected_model_id()
+        vision = self.ai_vision_model.text().strip() if hasattr(self, "ai_vision_model") else ""
+        return (
+            self._ai_provider_value(), self.ai_endpoint.text().strip(),
+            self.ai_key.text().strip(), int(self.ai_timeout.value()), model, vision,
+            str(self.app.config.get("ai_vision_model") or ""),
+            self._selected_ai_probe_model(vision or model),
+        )
+
+    def _ai_task_pending(self, tid):
+        return any(job[0] == tid for job in getattr(self, "_ai_task_jobs", {}).values())
+
+    def _ai_task_buttons(self, tid):
+        names = {
+            "settings:ai_connect": ("ai_test_btn", "ai_refresh_btn"),
+            "settings:ai_vision": ("ai_vision_btn",),
+            "settings:embedded_gemini_vision": ("ai_embedded_test_btn",),
+            "settings:ai_infer": ("ai_infer_btn",),
+        }.get(tid, ())
+        return [getattr(self, name) for name in names if hasattr(self, name)]
+
+    def _submit_ai_task(self, tid, title, worker, done, failed=None):
+        if self._ai_task_pending(tid):
+            return False
+        self._ai_task_jobs = getattr(self, "_ai_task_jobs", {})
+        self._ai_task_serial = getattr(self, "_ai_task_serial", 0) + 1
+        task_id = f"{tid}:{id(self)}:{self._ai_task_serial}"
+        self._ai_task_jobs[task_id] = (tid, self._ai_task_signature(), done, failed)
+        if not getattr(self, "_ai_task_hooked", False):
+            self.app.tasks.task_result.connect(self._on_ai_task_result)
+            self.app.tasks.task_failed.connect(self._on_ai_task_failed)
+            if hasattr(self.app.tasks, "task_finished"):
+                self.app.tasks.task_finished.connect(self._on_ai_task_finished)
+            self._ai_task_hooked = True
+        for button in self._ai_task_buttons(tid):
+            button.setEnabled(False)
+        try:
+            accepted = self.app.tasks.submit(task_id, title, worker)
+        except Exception as error:
+            self._on_ai_task_failed(task_id, str(error))
+            return False
+        if accepted is False:
+            self._on_ai_task_failed(task_id, "Task submission rejected")
+            return False
+        return True
+
+    def _take_ai_task(self, tid):
+        job = getattr(self, "_ai_task_jobs", {}).pop(tid, None)
+        if job is not None:
+            for button in self._ai_task_buttons(job[0]):
+                button.setEnabled(True)
+        return job
+
+    def _on_ai_task_finished(self, tid, *args):
+        self._take_ai_task(tid)
 
     def _on_ai_task_result(self,tid,result):
-        cb=getattr(self,"_ai_task_callbacks",{}).pop(tid,None)
-        if cb: cb(result)
+        job = self._take_ai_task(tid)
+        if job is not None and job[1] == self._ai_task_signature():
+            job[2](result)
 
     def _on_ai_task_failed(self,tid,error):
-        self._ai_task_callbacks=getattr(self,"_ai_task_callbacks",{})
-        self._ai_task_callbacks_fail=getattr(self,"_ai_task_callbacks_fail",{})
-        cb_fail=self._ai_task_callbacks_fail.pop(tid,None)
-        if cb_fail:
-            self._ai_task_callbacks.pop(tid,None)
+        job = self._take_ai_task(tid)
+        if job is None or job[1] != self._ai_task_signature():
+            return
+        tid, _signature, _done, cb_fail = job
+        if cb_fail is not None:
             cb_fail(tid,error)
             return
-        if tid in self._ai_task_callbacks: self._ai_task_callbacks.pop(tid,None)
+        error = str(error)
         if tid == "settings:ai_connect":
             self.app.config.set("ai_last_connection", "degraded_remote")
-            # Keep the last known-good model cache so the app can still resume with
-            # a manually selected model when the provider comes back.
+            # Keep the last known-good model cache when a remote probe fails.
             self.ai_models_cache=self.app.config.get("ai_models_cache", []) or getattr(self,"ai_models_cache", []) or []
             self._render_ai_model_lists()
         if tid.startswith("settings:ai_"):
             self.ai_status.setText(f"⚠️ Remote AI tidak tersedia: {error[:220]} • LOCAL FALLBACK SIAP")
-            self.ai_test_btn.setEnabled(True); self.ai_refresh_btn.setEnabled(True)
-            if tid == "settings:ai_vision" and hasattr(self, "ai_vision_btn"):
-                self.ai_vision_btn.setEnabled(True)
-            if tid == "settings:ai_infer" and hasattr(self, "ai_infer_btn"):
-                self.ai_infer_btn.setEnabled(True)
 
     def _render_ai_model_lists(self):
         models=getattr(self,"ai_models_cache", None) or self.app.config.get("ai_models_cache", []) or []

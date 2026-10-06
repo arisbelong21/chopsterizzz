@@ -15,20 +15,8 @@ if exist "%~dp0ffprobe.exe" (set "HAVE_FFPROBE=1") else (where ffprobe >nul 2>&1
 if not defined HAVE_FFMPEG set "NEED_FFMPEG=1"
 if not defined HAVE_FFPROBE set "NEED_FFMPEG=1"
 
-if exist "%~dp0deno.exe" (
-  set "DENO_CMD=%~dp0deno.exe"
-) else (
-  for /f "delims=" %%D in ('where deno 2^>nul') do if not defined DENO_CMD set "DENO_CMD=%%D"
-)
-if defined DENO_CMD (
-  powershell -NoProfile -Command "$line = (& '%DENO_CMD%' --version 2>$null | Select-Object -First 1); if ($line -match '^deno\s+(\d+)\.(\d+)\.(\d+)') { if ([int]$matches[1] -gt 2 -or ([int]$matches[1] -eq 2 -and [int]$matches[2] -ge 3)) { exit 0 } }; exit 1" >nul 2>&1
-  if errorlevel 1 set "DENO_CMD="
-)
-if not defined DENO_CMD (
-  where node >nul 2>&1
-  if not errorlevel 1 node -e "process.exit(Number(process.versions.node.split('.')[0]) >= 22 ? 0 : 1)" >nul 2>&1
-  if errorlevel 1 set "NEED_DENO=1"
-)
+call :check_js_runtime
+if errorlevel 1 set "NEED_DENO=1"
 
 reg query "HKLM\SOFTWARE\Microsoft\VisualStudio\14.0\VC\Runtimes\x64" /v Installed 2>nul | findstr /i "0x1" >nul
 if errorlevel 1 set "NEED_VC=1"
@@ -67,6 +55,17 @@ if errorlevel 1 if not exist "%~dp0ffprobe.exe" (
   echo [WARN] FFprobe belum terdeteksi di PATH. Buka ulang sesi Windows lalu jalankan setup lagi.
   set "VERIFY_FAIL=1"
 )
+REM Failed WinGet attempts must not be reported as a successful setup.
+call :check_js_runtime
+if errorlevel 1 (
+  echo [WARN] Deno 2.3+ atau Node.js 22+ belum dapat dijalankan. Buka ulang terminal setelah instalasi.
+  set "VERIFY_FAIL=1"
+)
+reg query "HKLM\SOFTWARE\Microsoft\VisualStudio\14.0\VC\Runtimes\x64" /v Installed 2>nul | findstr /i "0x1" >nul
+if errorlevel 1 (
+  echo [WARN] Microsoft Visual C++ Runtime x64 belum terdeteksi.
+  set "VERIFY_FAIL=1"
+)
 if "%VERIFY_FAIL%"=="1" goto :fail
 
 echo [OK] Dependensi eksternal terpasang/tersedia.
@@ -80,3 +79,19 @@ echo.
 echo [ERROR] Setup belum lengkap. Periksa pesan di atas dan jalankan setup kembali.
 if not defined NOPAUSE pause
 exit /b 1
+
+:check_js_runtime
+set "DENO_CMD="
+if exist "%~dp0deno.exe" (
+  set "DENO_CMD=%~dp0deno.exe"
+) else (
+  for /f "delims=" %%D in ('where deno 2^>nul') do if not defined DENO_CMD set "DENO_CMD=%%D"
+)
+if defined DENO_CMD (
+  powershell -NoProfile -Command "$line = (& $env:DENO_CMD --version 2>$null | Select-Object -First 1); if ($line -match '^deno\s+(\d+)\.(\d+)\.(\d+)') { if ([int]$matches[1] -gt 2 -or ([int]$matches[1] -eq 2 -and [int]$matches[2] -ge 3)) { exit 0 } }; exit 1" >nul 2>&1
+  if not errorlevel 1 exit /b 0
+)
+where node >nul 2>&1
+if errorlevel 1 exit /b 1
+node -e "process.exit(Number(process.versions.node.split('.')[0]) >= 22 ? 0 : 1)" >nul 2>&1
+exit /b %errorlevel%

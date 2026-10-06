@@ -86,10 +86,7 @@ async def retry_batch_rendering(
         raise HTTPException(status_code=400, detail="Batch configuration expired. Please start a new render.")
 
     if batch.get("overall_status") == "running":
-        # Check if any clip is actively running
-        running = any(c.get("status") in ["downloading", "transcribing", "rendering"] for c in batch.get("clips", []))
-        if running:
-            raise HTTPException(status_code=400, detail="Batch is currently rendering. Please wait for the current clip to finish.")
+        raise HTTPException(status_code=400, detail="Batch is currently rendering. Please wait for the current clip to finish.")
 
     req = BATCH_REQUESTS[batch_id]
     indices_to_retry: List[int] = []

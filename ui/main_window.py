@@ -1,7 +1,7 @@
 """Main window — sidebar + stacked pages."""
 from __future__ import annotations
 
-from PySide6.QtCore import Qt
+from PySide6.QtCore import Qt, QTimer
 from PySide6.QtWidgets import QMainWindow, QWidget, QHBoxLayout, QStackedWidget, QMessageBox, QLabel, QPushButton, QVBoxLayout
 
 from chopster.ui.navigation import Sidebar
@@ -150,7 +150,20 @@ class MainWindow(QMainWindow):
         except Exception:
             pass
 
+    def _finish_task_shutdown(self):
+        if self.app.tasks.wait_for_done(0):
+            self._task_close_timer.stop()
+            self.close()
+
     def closeEvent(self, event):
+        if getattr(self, "_waiting_for_tasks", False):
+            if not self.app.tasks.wait_for_done(0):
+                event.ignore()
+                return
+            self._task_close_timer.stop()
+            self.app.shutdown()
+            super().closeEvent(event)
+            return
         # persist window size
         try:
             self.app.config.update({"window_width": self.width(), "window_height": self.height()})
@@ -172,13 +185,26 @@ class MainWindow(QMainWindow):
             if ret != QMessageBox.Yes:
                 event.ignore()
                 return
+        if self.app.tasks.has_active_tasks() and not getattr(self.page_downloader, "_running", False):
+            ret = QMessageBox.question(self, "Keluar", "Tugas masih berjalan. Batalkan tugas dan keluar setelah proses berhenti?", QMessageBox.Yes | QMessageBox.No)
+            if ret != QMessageBox.Yes:
+                event.ignore()
+                return
         try:
             if hasattr(self.page_auto_clip, "shutdown"):
                 self.page_auto_clip.shutdown()
         except Exception:
             pass
-        try:
-            self.app.shutdown()
-        except Exception:
-            pass
+        self.app.tasks.begin_shutdown()
+        if not self.app.tasks.wait_for_done(0):
+            # Keep the Qt event loop and widgets alive while cancellation settles.
+            self._waiting_for_tasks = True
+            self.setEnabled(False)
+            self._task_close_timer = QTimer(self)
+            self._task_close_timer.setInterval(100)
+            self._task_close_timer.timeout.connect(self._finish_task_shutdown)
+            self._task_close_timer.start()
+            event.ignore()
+            return
+        self.app.shutdown()
         super().closeEvent(event)

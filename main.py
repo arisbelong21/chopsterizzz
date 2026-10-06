@@ -4,15 +4,32 @@ from __future__ import annotations
 import sys
 from pathlib import Path
 
-# Make `import chopster` work BEFORE importing any chopster.* module.
-# When launched as `python main.py` from inside the package directory, Python
-# normally puts only `chopster/` on sys.path, not its parent.  The previous
-# build imported crash_guard too early, which caused `ModuleNotFoundError`.
-ROOT = Path(__file__).resolve().parent          # chopster/
-PARENT = ROOT.parent                             # project folder
+# Resolve source imports from this entry point, not the extraction folder's
+# spelling or the caller's working directory. Python package imports remain
+# case-sensitive on Windows (e.g. Chopster/ is not the package chopster).
+ROOT = Path(__file__).resolve().parent
+PARENT = ROOT.parent
 for p in (str(PARENT), str(ROOT)):
     if p not in sys.path:
         sys.path.insert(0, p)
+
+# Frozen builds keep PyInstaller's import loader; only source launches need
+# the explicit package alias. Register before execution for relative imports.
+if not getattr(sys, "frozen", False) and "chopster" not in sys.modules:
+    from importlib.util import module_from_spec, spec_from_file_location
+
+    _package_spec = spec_from_file_location(
+        "chopster", ROOT / "__init__.py", submodule_search_locations=[str(ROOT)]
+    )
+    if _package_spec is None or _package_spec.loader is None:
+        raise ImportError(f"Cannot load Chopster package from {ROOT}")
+    _package = module_from_spec(_package_spec)
+    sys.modules["chopster"] = _package
+    try:
+        _package_spec.loader.exec_module(_package)
+    except BaseException:
+        sys.modules.pop("chopster", None)
+        raise
 
 from chopster.app.winconsole import install as _install_hidden_console
 from chopster.app.crash_guard import install_crash_guard
@@ -47,6 +64,7 @@ def main() -> int:
             pass
 
     core = Application()
+    app_qt.aboutToQuit.connect(core.shutdown)
     win = MainWindow(core)
     core.window = win  # for Browser Bridge -> UI forwarding
     win.show()
