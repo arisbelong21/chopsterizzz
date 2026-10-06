@@ -1,0 +1,835 @@
+import React, { useState } from 'react';
+import { useLanguage } from '../locales';
+import type {
+  ViralClip,
+  RenderSettings,
+  AspectRatioOption,
+  BackgroundStyle,
+  CaptionStyle,
+  CaptionFont,
+  TitlePosition,
+  StreamerPreset,
+  FacecamPosition,
+  FontSizeOption,
+  TextCaseOption
+} from '../types';
+
+interface ClipStudioModalProps {
+  isOpen: boolean;
+  onClose: () => void;
+  markedClips: ViralClip[];
+  allClips: ViralClip[];
+  onStartRender: (settings: RenderSettings) => void;
+  isRendering: boolean;
+}
+
+export const ClipStudioModal: React.FC<ClipStudioModalProps> = ({
+  isOpen,
+  onClose,
+  markedClips,
+  allClips,
+  onStartRender,
+  isRendering,
+}) => {
+  const { t } = useLanguage();
+  // Default to marked clips if any, otherwise all clips
+  const initialClips = markedClips.length > 0 ? markedClips : allClips.slice(0, 3);
+  
+  const [selectedClips, setSelectedClips] = useState<ViralClip[]>(initialClips);
+  const [aspectRatio, setAspectRatio] = useState<AspectRatioOption>('9:16');
+  const [backgroundStyle, setBackgroundStyle] = useState<BackgroundStyle>('black');
+  const [enableFaceTracking, setEnableFaceTracking] = useState<boolean>(true);
+  const [streamerPreset, setStreamerPreset] = useState<StreamerPreset>('none');
+  const [facecamPosition, setFacecamPosition] = useState<FacecamPosition>('auto');
+  const [titleText, setTitleText] = useState<string>('');
+  const [titlePosition, setTitlePosition] = useState<TitlePosition>('auto');
+  const [captionStyle, setCaptionStyle] = useState<CaptionStyle>('viral_pop');
+  const [captionFont, setCaptionFont] = useState<CaptionFont>('Outfit');
+  const [fontSize, setFontSize] = useState<FontSizeOption>('medium');
+  const [titleFontSize, setTitleFontSize] = useState<FontSizeOption>('medium');
+  const [textCase, setTextCase] = useState<TextCaseOption>('uppercase');
+
+  if (!isOpen) return null;
+
+  const availableClips = markedClips.length > 0 ? markedClips : allClips;
+
+  const toggleClip = (clip: ViralClip) => {
+    if (selectedClips.some(c => c.start_time === clip.start_time && c.end_time === clip.end_time)) {
+      if (selectedClips.length > 1) {
+        setSelectedClips(selectedClips.filter(c => !(c.start_time === clip.start_time && c.end_time === clip.end_time)));
+      }
+    } else {
+      setSelectedClips([...selectedClips, clip]);
+    }
+  };
+
+  const handleToggleAll = () => {
+    if (selectedClips.length === availableClips.length) {
+      setSelectedClips(availableClips.slice(0, 1));
+    } else {
+      setSelectedClips([...availableClips]);
+    }
+  };
+
+  const handleLaunch = () => {
+    onStartRender({
+      aspectRatio,
+      backgroundStyle,
+      enableFaceTracking,
+      streamerPreset,
+      facecamPosition,
+      titleText,
+      titlePosition,
+      titleFontSize,
+      captionStyle,
+      captionFont,
+      fontSize,
+      textCase,
+      selectedClips
+    });
+  };
+
+  const applyLetterCase = (text: string, style: TextCaseOption): string => {
+    if (style === 'uppercase') return text.toUpperCase();
+    if (style === 'lowercase') return text.toLowerCase();
+    return text.toLowerCase().replace(/(?:^|\s|\b)\w/g, c => c.toUpperCase());
+  };
+
+  const formatTitlePreview = (rawText: string, style: TextCaseOption): string => {
+    const text = applyLetterCase(rawText, style);
+    if (text.length > 24) {
+      const mid = Math.floor(text.length / 2);
+      const leftSpace = text.lastIndexOf(' ', mid);
+      const rightSpace = text.indexOf(' ', mid);
+      let splitIdx = -1;
+      if (leftSpace !== -1 && rightSpace !== -1) {
+        splitIdx = (mid - leftSpace < rightSpace - mid) ? leftSpace : rightSpace;
+      } else if (leftSpace !== -1) {
+        splitIdx = leftSpace;
+      } else if (rightSpace !== -1) {
+        splitIdx = rightSpace;
+      }
+      if (splitIdx !== -1) {
+        return text.substring(0, splitIdx) + '\n' + text.substring(splitIdx + 1);
+      }
+    }
+    return text;
+  };
+
+  // Preview dimensions for the wireframe mock
+  const isLandscape = aspectRatio === '16:9_landscape';
+  const phoneWidth = isLandscape ? 380 : 240;
+  const phoneHeight = isLandscape ? 214 : (240 * 16) / 9; // 426.6px
+
+  return (
+    <div className="modal-backdrop" onClick={onClose}>
+      <div className="studio-modal-card" onClick={e => e.stopPropagation()}>
+        {/* Header */}
+        <div className="studio-modal-header">
+          <div className="studio-header-title">
+            <div className="studio-icon-badge">🎬</div>
+            <div>
+              <div className="studio-title-row">
+                <h2>{t.studio.heading}</h2>
+                <span className="pro-badge">PRO</span>
+              </div>
+              <p className="studio-header-desc">
+                {t.studio.subtext}
+              </p>
+            </div>
+          </div>
+          <button className="studio-close-btn" onClick={onClose} disabled={isRendering}>
+            ✕
+          </button>
+        </div>
+
+        {/* Studio Content Grid */}
+        <div className="studio-content-grid">
+          {/* Controls Column */}
+          <div className="studio-controls-col">
+            {/* 1. Aspect Ratio */}
+            <div className="studio-section">
+              <label className="studio-label">
+                <span>{t.studio.canvasTitle}</span>
+                <span className="studio-tag">{t.studio.canvasBadgeVertical}</span>
+              </label>
+              <div className="aspect-options-grid">
+                <button
+                  type="button"
+                  className={`aspect-card-btn ${aspectRatio === '9:16' ? 'active' : ''}`}
+                  onClick={() => setAspectRatio('9:16')}
+                >
+                  <div className="aspect-icon-box ratio-916"></div>
+                  <span className="aspect-name">{t.studio.ratio916}</span>
+                  <span className="aspect-sub">{t.studio.ratio916Sub}</span>
+                </button>
+
+                <button
+                  type="button"
+                  className={`aspect-card-btn ${aspectRatio === '1:1' ? 'active' : ''}`}
+                  onClick={() => setAspectRatio('1:1')}
+                >
+                  <div className="aspect-icon-box ratio-11"></div>
+                  <span className="aspect-name">{t.studio.ratio11}</span>
+                  <span className="aspect-sub">{t.studio.ratio11Sub}</span>
+                </button>
+
+                <button
+                  type="button"
+                  className={`aspect-card-btn ${aspectRatio === '4:3' ? 'active' : ''}`}
+                  onClick={() => setAspectRatio('4:3')}
+                >
+                  <div className="aspect-icon-box ratio-43"></div>
+                  <span className="aspect-name">{t.studio.ratio43}</span>
+                  <span className="aspect-sub">{t.studio.ratio43Sub}</span>
+                </button>
+
+                <button
+                  type="button"
+                  className={`aspect-card-btn ${aspectRatio === '16:9' ? 'active' : ''}`}
+                  onClick={() => setAspectRatio('16:9')}
+                >
+                  <div className="aspect-icon-box ratio-169"></div>
+                  <span className="aspect-name">{t.studio.ratio169}</span>
+                  <span className="aspect-sub">{t.studio.ratio169Sub}</span>
+                </button>
+
+                <button
+                  type="button"
+                  className={`aspect-card-btn ${aspectRatio === '16:9_landscape' ? 'active' : ''}`}
+                  onClick={() => setAspectRatio('16:9_landscape')}
+                >
+                  <div className="aspect-icon-box ratio-169landscape"></div>
+                  <span className="aspect-name">{t.studio.ratio169Landscape || '16:9 Landscape'}</span>
+                  <span className="aspect-sub">{t.studio.ratio169LandscapeSub || 'True 1920×1080'}</span>
+                </button>
+              </div>
+
+              {/* Background Style when bars are active */}
+              {aspectRatio !== '9:16' && aspectRatio !== '16:9_landscape' && (
+                <div className="studio-sub-toggle">
+                  <span className="sub-toggle-label">{t.studio.marginBackdrop}</span>
+                  <div className="toggle-pill-group">
+                    <button
+                      type="button"
+                      className={`pill-btn ${backgroundStyle === 'black' ? 'active' : ''}`}
+                      onClick={() => setBackgroundStyle('black')}
+                    >
+                      {t.studio.blackBars}
+                    </button>
+                    <button
+                      type="button"
+                      className={`pill-btn ${backgroundStyle === 'blurred' ? 'active' : ''}`}
+                      onClick={() => setBackgroundStyle('blurred')}
+                    >
+                      {t.studio.blurredVideo}
+                    </button>
+                  </div>
+                </div>
+              )}
+
+              {/* Face & Object tracking toggle for 9:16 */}
+              {aspectRatio === '9:16' && (
+                <div style={{ marginTop: '0.75rem' }}>
+                  <div className="studio-checkbox-row">
+                    <input
+                      type="checkbox"
+                      id="faceTracking"
+                      checked={enableFaceTracking}
+                      onChange={e => setEnableFaceTracking(e.target.checked)}
+                    />
+                    <label htmlFor="faceTracking">
+                      <strong>{t.studio.faceTracking}</strong> {t.studio.faceTrackingDesc}
+                    </label>
+                  </div>
+
+                  {enableFaceTracking && streamerPreset === 'none' && (
+                    <div className="horizontal-framing-selector" style={{ marginTop: '0.65rem', paddingLeft: '1.6rem' }}>
+                      <div style={{ fontSize: '0.78rem', color: 'var(--text-secondary)', marginBottom: '0.4rem' }}>
+                        {t.studio.horizontalFramingLabel || 'Horizontal Framing / Focal Point:'}
+                      </div>
+                      <div className="pill-group framing-pills" style={{ display: 'flex', flexWrap: 'wrap', gap: '0.4rem' }}>
+                        {[
+                          { id: 'auto', label: t.studio.framingAuto || '🤖 AI Auto' },
+                          { id: 'center', label: t.studio.framingCenter || '🎯 Center (50%)' },
+                          { id: 'left', label: t.studio.framingLeft || '⬅️ Left Focus (35%)' },
+                          { id: 'right', label: t.studio.framingRight || '➡️ Right Focus (65%)' },
+                        ].map(opt => (
+                          <button
+                            key={opt.id}
+                            type="button"
+                            className={`pill-btn ${facecamPosition === opt.id ? 'active' : ''}`}
+                            style={{ fontSize: '0.75rem', padding: '0.3rem 0.65rem' }}
+                            onClick={() => setFacecamPosition(opt.id as FacecamPosition)}
+                          >
+                            {opt.label}
+                          </button>
+                        ))}
+                      </div>
+                    </div>
+                  )}
+                </div>
+              )}
+            </div>
+
+            {/* 2. Streamer Facecam Presets */}
+            <div className="studio-section">
+              <label className="studio-label">
+                <span>{t.studio.streamerTitle}</span>
+              </label>
+              <div className="streamer-presets-row">
+                <button
+                  type="button"
+                  className={`streamer-btn ${streamerPreset === 'none' ? 'active' : ''}`}
+                  onClick={() => setStreamerPreset('none')}
+                >
+                  {t.studio.streamerNone}
+                </button>
+                <button
+                  type="button"
+                  className={`streamer-btn ${streamerPreset === 'split_top_cam' ? 'active' : ''}`}
+                  onClick={() => setStreamerPreset('split_top_cam')}
+                >
+                  {t.studio.streamerSplit}
+                </button>
+                <button
+                  type="button"
+                  className={`streamer-btn ${streamerPreset === 'pip_corner' ? 'active' : ''}`}
+                  onClick={() => setStreamerPreset('pip_corner')}
+                >
+                  {t.studio.streamerPip}
+                </button>
+              </div>
+
+              {streamerPreset !== 'none' && (
+                <div style={{ marginTop: '0.85rem' }}>
+                  <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: '0.45rem' }}>
+                    <span style={{ fontSize: '0.82rem', fontWeight: 600, color: 'var(--text-secondary)' }}>
+                      {t.studio.facecamPositionLabel || 'Facecam Position in Source:'}
+                    </span>
+                    <span style={{ fontSize: '0.72rem', color: '#38bdf8', background: 'rgba(56, 189, 248, 0.12)', border: '1px solid rgba(56, 189, 248, 0.25)', padding: '0.1rem 0.45rem', borderRadius: '4px' }}>
+                      {facecamPosition === 'auto' ? 'AI AUTO-DETECT' : facecamPosition.toUpperCase().replace('_', '-')}
+                    </span>
+                  </div>
+                  <div className="toggle-pill-group" style={{ display: 'flex', flexWrap: 'wrap', gap: '0.35rem' }}>
+                    {[
+                      { id: 'auto', label: t.studio.facecamAuto || 'Auto (AI Detect)' },
+                      { id: 'bottom_right', label: t.studio.facecamBottomRight || 'Bottom-Right' },
+                      { id: 'top_right', label: t.studio.facecamTopRight || 'Top-Right' },
+                      { id: 'bottom_left', label: t.studio.facecamBottomLeft || 'Bottom-Left' },
+                      { id: 'top_left', label: t.studio.facecamTopLeft || 'Top-Left' },
+                      { id: 'center', label: t.studio.facecamCenter || 'Center' },
+                    ].map(opt => (
+                      <button
+                        key={opt.id}
+                        type="button"
+                        className={`pill-btn ${facecamPosition === opt.id ? 'active' : ''}`}
+                        onClick={() => setFacecamPosition(opt.id as FacecamPosition)}
+                        style={{ fontSize: '0.74rem', padding: '0.25rem 0.6rem' }}
+                      >
+                        {opt.label}
+                      </button>
+                    ))}
+                  </div>
+                </div>
+              )}
+            </div>
+
+            {/* 3. Title / Hook Banner */}
+            <div className="studio-section">
+              <label className="studio-label">
+                <span>{t.studio.titleBannerTitle}</span>
+                <span className="studio-tag" style={{ background: 'rgba(59, 130, 246, 0.2)', color: '#60a5fa' }}>
+                  {aspectRatio === '9:16' ? 'Position: 4:3 Upper Edge' : 'On Top of Content'}
+                </span>
+              </label>
+              <div className="title-inputs-row">
+                <input
+                  type="text"
+                  className="studio-text-input"
+                  placeholder={t.studio.titlePlaceholder}
+                  value={titleText}
+                  onChange={e => setTitleText(e.target.value)}
+                />
+                <select
+                  className="studio-select"
+                  value={titlePosition}
+                  onChange={e => setTitlePosition(e.target.value as TitlePosition)}
+                >
+                  <option value="auto">Top of Content Edge</option>
+                  <option value="none">No Title Banner</option>
+                </select>
+              </div>
+
+              {titlePosition !== 'none' && (
+                <div className="studio-sub-toggle" style={{ marginTop: '0.65rem' }}>
+                  <span className="sub-toggle-label">{t.studio.titleFontSize || "Title Text Size:"}</span>
+                  <div className="toggle-pill-group">
+                    <button
+                      type="button"
+                      className={`pill-btn ${titleFontSize === 'small' ? 'active' : ''}`}
+                      onClick={() => setTitleFontSize('small')}
+                    >
+                      {t.studio.sizeSmall}
+                    </button>
+                    <button
+                      type="button"
+                      className={`pill-btn ${titleFontSize === 'medium' ? 'active' : ''}`}
+                      onClick={() => setTitleFontSize('medium')}
+                    >
+                      {t.studio.sizeMedium}
+                    </button>
+                    <button
+                      type="button"
+                      className={`pill-btn ${titleFontSize === 'big' ? 'active' : ''}`}
+                      onClick={() => setTitleFontSize('big')}
+                    >
+                      {t.studio.sizeBig}
+                    </button>
+                  </div>
+                </div>
+              )}
+            </div>
+
+            {/* 4. Subtitle Style & Font */}
+            <div className="studio-section">
+              <label className="studio-label">
+                <span>{t.studio.subtitlesTitle}</span>
+                <span className="studio-tag" style={{ background: 'rgba(34, 197, 94, 0.2)', color: '#4ade80' }}>
+                  {t.studio.strictlyOneLine}
+                </span>
+              </label>
+              <div className="caption-styles-grid">
+                <button
+                  type="button"
+                  className={`caption-style-card viral-pop ${captionStyle === 'viral_pop' ? 'active' : ''}`}
+                  onClick={() => setCaptionStyle('viral_pop')}
+                >
+                  <div className="caption-preview-text">
+                    VIRAL <span className="pop-yellow">POP</span>
+                  </div>
+                  <span className="caption-style-sub">{t.studio.styleViralPopSub}</span>
+                </button>
+
+                <button
+                  type="button"
+                  className={`caption-style-card beast-punch ${captionStyle === 'beast_punch' ? 'active' : ''}`}
+                  onClick={() => setCaptionStyle('beast_punch')}
+                >
+                  <div className="caption-preview-text">
+                    BEAST <span className="pop-green">PUNCH</span>
+                  </div>
+                  <span className="caption-style-sub">{t.studio.styleBeastPunchSub}</span>
+                </button>
+
+                <button
+                  type="button"
+                  className={`caption-style-card cyber-violet ${captionStyle === 'cyber_violet' ? 'active' : ''}`}
+                  onClick={() => setCaptionStyle('cyber_violet')}
+                >
+                  <div className="caption-preview-text">
+                    CYBER <span className="pop-violet">VIOLET</span>
+                  </div>
+                  <span className="caption-style-sub">{t.studio.styleCyberVioletSub}</span>
+                </button>
+
+                <button
+                  type="button"
+                  className={`caption-style-card fire-red ${captionStyle === 'fire_red' ? 'active' : ''}`}
+                  onClick={() => setCaptionStyle('fire_red')}
+                >
+                  <div className="caption-preview-text">
+                    FIRE <span className="pop-red">CRIMSON</span>
+                  </div>
+                  <span className="caption-style-sub">{t.studio.styleFireRedSub}</span>
+                </button>
+
+                <button
+                  type="button"
+                  className={`caption-style-card electric-cyan ${captionStyle === 'electric_cyan' ? 'active' : ''}`}
+                  onClick={() => setCaptionStyle('electric_cyan')}
+                >
+                  <div className="caption-preview-text">
+                    ELECTRIC <span className="pop-cyan">CYAN</span>
+                  </div>
+                  <span className="caption-style-sub">{t.studio.styleElectricCyanSub}</span>
+                </button>
+
+                <button
+                  type="button"
+                  className={`caption-style-card golden-aura ${captionStyle === 'golden_aura' ? 'active' : ''}`}
+                  onClick={() => setCaptionStyle('golden_aura')}
+                >
+                  <div className="caption-preview-text">
+                    GOLDEN <span className="pop-gold">AURA</span>
+                  </div>
+                  <span className="caption-style-sub">{t.studio.styleGoldenAuraSub}</span>
+                </button>
+
+                <button
+                  type="button"
+                  className={`caption-style-card clean-minimal ${captionStyle === 'clean_minimal' ? 'active' : ''}`}
+                  onClick={() => setCaptionStyle('clean_minimal')}
+                >
+                  <div className="caption-preview-text">
+                    <span className="pill-badge">{t.studio.styleCleanMinimal}</span>
+                  </div>
+                  <span className="caption-style-sub">{t.studio.styleCleanMinimalSub}</span>
+                </button>
+
+                <button
+                  type="button"
+                  className={`caption-style-card none ${captionStyle === 'none' ? 'active' : ''}`}
+                  onClick={() => setCaptionStyle('none')}
+                >
+                  <div className="caption-preview-text">{t.studio.styleNone}</div>
+                  <span className="caption-style-sub">{t.studio.styleNoneSub}</span>
+                </button>
+              </div>
+
+              {captionStyle !== 'none' && (
+                <>
+                  <div className="studio-sub-toggle" style={{ marginTop: '0.75rem' }}>
+                    <span className="sub-toggle-label">{t.studio.fontFamily}</span>
+                    <div className="toggle-pill-group" style={{ flexWrap: 'wrap' }}>
+                      {(
+                        [
+                          'Outfit',
+                          'Montserrat',
+                          'Inter',
+                          'Impact',
+                          'Bebas Neue',
+                          'Anton',
+                          'Poppins',
+                          'Arial Black',
+                        ] as CaptionFont[]
+                      ).map(font => (
+                        <button
+                          key={font}
+                          type="button"
+                          className={`pill-btn ${captionFont === font ? 'active' : ''}`}
+                          onClick={() => setCaptionFont(font)}
+                          style={{ fontFamily: font, fontSize: '0.78rem' }}
+                        >
+                          {font}
+                        </button>
+                      ))}
+                    </div>
+                  </div>
+
+                  {/* Font Size Presets */}
+                  <div className="studio-sub-toggle" style={{ marginTop: '0.75rem' }}>
+                    <span className="sub-toggle-label">{t.studio.fontSize}</span>
+                    <div className="toggle-pill-group">
+                      <button
+                        type="button"
+                        className={`pill-btn ${fontSize === 'small' ? 'active' : ''}`}
+                        onClick={() => setFontSize('small')}
+                      >
+                        {t.studio.sizeSmall}
+                      </button>
+                      <button
+                        type="button"
+                        className={`pill-btn ${fontSize === 'medium' ? 'active' : ''}`}
+                        onClick={() => setFontSize('medium')}
+                      >
+                        {t.studio.sizeMedium}
+                      </button>
+                      <button
+                        type="button"
+                        className={`pill-btn ${fontSize === 'big' ? 'active' : ''}`}
+                        onClick={() => setFontSize('big')}
+                      >
+                        {t.studio.sizeBig}
+                      </button>
+                    </div>
+                  </div>
+
+                  {/* Text Letter Style Presets */}
+                  <div className="studio-sub-toggle" style={{ marginTop: '0.75rem' }}>
+                    <span className="sub-toggle-label">{t.studio.letterStyle}</span>
+                    <div className="toggle-pill-group">
+                      <button
+                        type="button"
+                        className={`pill-btn ${textCase === 'uppercase' ? 'active' : ''}`}
+                        onClick={() => setTextCase('uppercase')}
+                      >
+                        {t.studio.letterCaps}
+                      </button>
+                      <button
+                        type="button"
+                        className={`pill-btn ${textCase === 'capitalize' ? 'active' : ''}`}
+                        onClick={() => setTextCase('capitalize')}
+                      >
+                        {t.studio.letterTitle}
+                      </button>
+                      <button
+                        type="button"
+                        className={`pill-btn ${textCase === 'lowercase' ? 'active' : ''}`}
+                        onClick={() => setTextCase('lowercase')}
+                      >
+                        {t.studio.letterLower}
+                      </button>
+                    </div>
+                  </div>
+                </>
+              )}
+            </div>
+
+            {/* 5. Selected Clips Picker */}
+            <div className="studio-section">
+              <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: '0.4rem' }}>
+                <label className="studio-label" style={{ margin: 0 }}>
+                  <span>{t.studio.batchChecklist(selectedClips.length, availableClips.length)}</span>
+                </label>
+                {availableClips.length > 0 && (
+                  <button
+                    type="button"
+                    onClick={handleToggleAll}
+                    style={{
+                      background: selectedClips.length === availableClips.length ? 'rgba(239, 68, 68, 0.12)' : 'rgba(168, 85, 247, 0.15)',
+                      border: selectedClips.length === availableClips.length ? '1px solid rgba(239, 68, 68, 0.35)' : '1px solid rgba(168, 85, 247, 0.4)',
+                      color: selectedClips.length === availableClips.length ? '#f87171' : 'var(--primary, #a855f7)',
+                      borderRadius: '5px',
+                      padding: '0.18rem 0.5rem',
+                      fontSize: '0.72rem',
+                      fontWeight: 600,
+                      cursor: 'pointer',
+                    }}
+                  >
+                    {selectedClips.length === availableClips.length ? t.studio.unmarkAllClips : t.studio.markAllClips}
+                  </button>
+                )}
+              </div>
+              <div className="batch-clips-list">
+                {(markedClips.length > 0 ? markedClips : allClips).map((clip, i) => {
+                  const isSelected = selectedClips.some(
+                    c => c.start_time === clip.start_time && c.end_time === clip.end_time
+                  );
+                  return (
+                    <div
+                      key={i}
+                      className={`batch-clip-item ${isSelected ? 'selected' : ''}`}
+                      onClick={() => toggleClip(clip)}
+                    >
+                      <input
+                        type="checkbox"
+                        checked={isSelected}
+                        onChange={() => {}} // handled by parent onClick
+                      />
+                      <div className="batch-clip-info">
+                        <span className="batch-clip-title">
+                          {clip.title_suggestion || clip.title}
+                        </span>
+                        <span className="batch-clip-ts">
+                          ⏱️ {Math.floor(clip.start_time / 60)}:{(clip.start_time % 60).toFixed(0).padStart(2, '0')} -{' '}
+                          {Math.floor(clip.end_time / 60)}:{(clip.end_time % 60).toFixed(0).padStart(2, '0')} (
+                          {(clip.end_time - clip.start_time).toFixed(0)}s)
+                        </span>
+                      </div>
+                    </div>
+                  );
+                })}
+              </div>
+            </div>
+          </div>
+
+          {/* Live 9:16 Wireframe Preview Column */}
+          <div className="studio-preview-col">
+            <h4 className="preview-heading">{t.studio.previewWireframe}</h4>
+            <div
+              className={`phone-wireframe-container ${isLandscape ? 'is-landscape' : ''}`}
+              style={{ width: `${phoneWidth}px`, height: `${phoneHeight}px` }}
+            >
+              {/* Background (Black or Blurred) */}
+              <div className={`wireframe-bg ${backgroundStyle === 'blurred' && aspectRatio !== '9:16' && aspectRatio !== '16:9_landscape' ? 'blurred-ambient' : 'black-bg'}`}>
+                <div className={`wireframe-single-layout ${streamerPreset === 'split_top_cam' ? 'split-active' : ''}`}>
+                  {streamerPreset === 'split_top_cam' && (
+                    <>
+                      <div className={`wireframe-split-cam-box aspect-${aspectRatio.replace(':', '').replace('_', '')}`}>
+                        <div className="wireframe-facecam-skeleton">
+                          <div className="skeleton-grid-mesh"></div>
+                          <div className="skeleton-reticle">
+                            <span className="reticle-bracket top-left"></span>
+                            <span className="reticle-bracket top-right"></span>
+                            <span className="reticle-bracket bottom-left"></span>
+                            <span className="reticle-bracket bottom-right"></span>
+                            <div className="skeleton-avatar">
+                              <svg width="34" height="34" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" strokeLinejoin="round">
+                                <path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2"></path>
+                                <circle cx="12" cy="7" r="4"></circle>
+                              </svg>
+                            </div>
+                          </div>
+                          <div className="skeleton-label-wrap">
+                            <span className="skeleton-main-label">STREAMER CAM</span>
+                            <span className="skeleton-sub-label">
+                              {facecamPosition === 'auto' ? `AUTO FACE-CROP (${aspectRatio})` : `${facecamPosition.toUpperCase().replace('_', '-')} CROP (${aspectRatio})`}
+                            </span>
+                          </div>
+                        </div>
+                        <div className="wireframe-cam-badge">
+                          <span className="live-dot"></span> FACECAM ({facecamPosition === 'auto' ? 'AI AUTO' : facecamPosition.toUpperCase().replace('_', '-')})
+                        </div>
+                      </div>
+                      <div className="wireframe-split-divider"></div>
+                    </>
+                  )}
+
+                  <div className={`wireframe-content-box aspect-${aspectRatio.replace(':', '').replace('_', '')} ${streamerPreset === 'split_top_cam' ? 'split-mode' : ''}`}>
+                    <div className="wireframe-content-inner">
+                      <span className="content-ratio-tag">{aspectRatio === '16:9_landscape' ? '16:9 Landscape' : aspectRatio}</span>
+                      {streamerPreset === 'pip_corner' && (
+                        <div className="wireframe-pip-box">
+                          <div className="wireframe-pip-skeleton">
+                            <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round">
+                              <path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2"></path>
+                              <circle cx="12" cy="7" r="4"></circle>
+                            </svg>
+                            <span className="pip-skeleton-text">CAM</span>
+                          </div>
+                          <div className="wireframe-pip-badge">🔴 CAM</div>
+                        </div>
+                      )}
+                      {streamerPreset === 'split_top_cam' && (
+                        <div className="wireframe-gameplay-badge">
+                          🎮 GAMEPLAY ({aspectRatio})
+                        </div>
+                      )}
+                    </div>
+                  </div>
+                </div>
+
+                {/* Title Overlay Positioned Directly on Top of Content Box */}
+                {titlePosition !== 'none' && (
+                  <div
+                    className="wireframe-title-overlay"
+                    style={{
+                      top: (() => {
+                        if (streamerPreset === 'split_top_cam') return '24px';
+                        if (aspectRatio === '16:9_landscape') return '14px';
+                        if (aspectRatio === '1:1') return '58px'; // above 93px top edge
+                        if (aspectRatio === '4:3') return '88px'; // above 123px top edge
+                        if (aspectRatio === '16:9') return '110px'; // above 145px top edge
+                        return '88px'; // 9:16 fullscreen uses 4:3 position
+                      })(),
+                    }}
+                  >
+                    <span
+                      className="wireframe-title-text"
+                      style={{
+                        fontFamily: captionFont,
+                        fontSize: (titleFontSize || fontSize) === 'small' ? '0.66rem' : (titleFontSize || fontSize) === 'big' ? '0.88rem' : '0.74rem',
+                        lineHeight: 1.25,
+                        whiteSpace: 'pre-line',
+                        textAlign: 'center',
+                        background: 'transparent',
+                        boxShadow: 'none',
+                        border: 'none',
+                      }}
+                    >
+                      {formatTitlePreview(titleText || 'YOUR VIRAL HOOK TITLE', textCase)}
+                    </span>
+                  </div>
+                )}
+
+                {/* Subtitle Overlay Positioned on Bottom Edge (Mirroring Title) */}
+                {captionStyle !== 'none' && (
+                  <div
+                    className={`wireframe-caption-overlay style-${captionStyle}`}
+                    style={{
+                      bottom: (() => {
+                        if (aspectRatio === '16:9_landscape') return '14px';
+                        if (aspectRatio === '1:1') return '58px';
+                        if (aspectRatio === '4:3') return '88px';
+                        if (aspectRatio === '16:9') return '110px';
+                        return '88px'; // 9:16 fullscreen uses 4:3 position
+                      })(),
+                    }}
+                  >
+                    <span
+                      className="wireframe-caption-text"
+                      style={{
+                        fontFamily: captionFont,
+                        fontSize: fontSize === 'small' ? '0.72rem' : fontSize === 'big' ? '0.96rem' : '0.82rem',
+                      }}
+                    >
+                      {captionStyle === 'viral_pop' && (
+                        <>
+                          {applyLetterCase('DISCOVER THE', textCase)}{' '}
+                          <span className="pop-yellow">{applyLetterCase('VIRAL', textCase)}</span>{' '}
+                          {applyLetterCase('MOMENT', textCase)}
+                        </>
+                      )}
+                      {captionStyle === 'beast_punch' && (
+                        <>
+                          {applyLetterCase('UNREAL', textCase)}{' '}
+                          <span className="pop-green">{applyLetterCase('HACK', textCase)}</span>{' '}
+                          {applyLetterCase('TO GROW', textCase)}
+                        </>
+                      )}
+                      {captionStyle === 'cyber_violet' && (
+                        <>
+                          {applyLetterCase('CYBER', textCase)}{' '}
+                          <span className="pop-violet">{applyLetterCase('LEVEL', textCase)}</span>{' '}
+                          {applyLetterCase('UNLOCKED', textCase)}
+                        </>
+                      )}
+                      {captionStyle === 'fire_red' && (
+                        <>
+                          {applyLetterCase('CRITICAL', textCase)}{' '}
+                          <span className="pop-red">{applyLetterCase('DAMAGE', textCase)}</span>{' '}
+                          {applyLetterCase('ALERT', textCase)}
+                        </>
+                      )}
+                      {captionStyle === 'electric_cyan' && (
+                        <>
+                          {applyLetterCase('ELECTRIC', textCase)}{' '}
+                          <span className="pop-cyan">{applyLetterCase('ENERGY', textCase)}</span>{' '}
+                          {applyLetterCase('BOOST', textCase)}
+                        </>
+                      )}
+                      {captionStyle === 'golden_aura' && (
+                        <>
+                          {applyLetterCase('LUXURY', textCase)}{' '}
+                          <span className="pop-gold">{applyLetterCase('GOLDEN', textCase)}</span>{' '}
+                          {applyLetterCase('TICKET', textCase)}
+                        </>
+                      )}
+                      {captionStyle === 'clean_minimal' && (
+                        <span className="minimal-pill">
+                          {applyLetterCase('Automated AI Clipping', textCase)}
+                        </span>
+                      )}
+                    </span>
+                  </div>
+                )}
+              </div>
+            </div>
+            <p className="preview-tip">
+              Resolution: <strong>1080 × 1920 (9:16)</strong> · 30 FPS · H.264
+            </p>
+          </div>
+        </div>
+
+        {/* Footer Actions */}
+        <div className="studio-modal-footer">
+          <button className="studio-btn-cancel" onClick={onClose} disabled={isRendering}>
+            {t.studio.cancelBtn}
+          </button>
+          <button
+            className="studio-btn-render glowing-btn"
+            onClick={handleLaunch}
+            disabled={isRendering || selectedClips.length === 0}
+          >
+            {isRendering ? (
+              <>{t.studio.launchingRenderShort}</>
+            ) : (
+              <>{t.studio.batchRenderCta(selectedClips.length)}</>
+            )}
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+};

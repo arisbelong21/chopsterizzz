@@ -1,0 +1,3 @@
+# Optional: real multi-speaker diarization.
+# Install only when you want pyannote-based speaker labels.
+pyannote.audio>=3.3,<5

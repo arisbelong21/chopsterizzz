@@ -1,0 +1,26 @@
+PySide6==6.11.2
+yt-dlp[default,curl-cffi]==2026.8.19
+pillow==12.3.0
+# Transcription / local AI
+faster-whisper==1.2.1
+# CTranslate2 4.6.1 adds Python 3.14 support; keep below 4.6.3 for safer GPU compatibility.
+ctranslate2>=4.6.1,<4.6.3
+# faster-whisper 1.2.1 still uses av.open(..., metadata_errors=...),
+# which was removed in PyAV 19. Keep PyAV below 19 until upstream updates.
+av>=11,<19
+# openai==1.0.0
+# Optional local intelligence / production extras
+opencv-python-headless>=4.8,<5
+pyttsx3>=2.90,<3
+# Chopster Auto Clip Studio — integrated video clipping workspace
+fastapi>=0.115,<1
+uvicorn>=0.30,<1
+python-multipart>=0.0.9,<1
+pydantic>=2,<3
+google-genai>=1.0
+youtube-transcript-api>=1.0,<2
+python-dotenv>=1.0,<2
+requests>=2.31,<3
+
+# Build
+pyinstaller==6.22.3
