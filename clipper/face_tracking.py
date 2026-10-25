@@ -13,8 +13,24 @@ from typing import Any
 
 from chopster.clipper.camera_director import stabilize_camera_path, ai_camera_director, ai_camera_director_visual, apply_ai_shots, _local_motion_shots
 from chopster.clipper.adaptive_framing import decide_framing, decision_as_dict
+from chopster.clipper.split_screen import (
+    SPLIT_MULTI_FOCUS,
+    SPLIT_TWO_PERSON,
+    forced_panel_plan,
+    layout_panel_plan,
+    normalize_ai_windows,
+    panel_plan_for_range,
+    reaction_split_windows,
+)
+from chopster.clipper.panel_layout import LayoutProbe
 from chopster.clipper.speaker_diarization import diarize_audio, speaker_at
 from chopster.downloader.ffmpeg import find_ffmpeg
+
+
+# Modes that run the subject tracker. The two split-screen compositions reuse the
+# same tracked timeline, so they are added here; every legacy mode keeps its
+# existing code path untouched.
+TRACKING_MODES = ("Smart", "Speaker Focus", "AI Camera Director", SPLIT_TWO_PERSON, SPLIT_MULTI_FOCUS)
 
 
 def _clamp(v: float) -> float:
@@ -198,6 +214,32 @@ def _safe_group(subjects, width: int, height: int):
     return (left + right) * .5, (top + bottom) * .5, left, right, top, bottom
 
 
+def _layout_subjects(timeline) -> list[dict[str, float]]:
+    """Subject boxes (normalised) taken from the tracked timeline rows.
+
+    Only used by the two-feed fallback, to aim each feed panel at the person the
+    tracker did see inside that feed.
+    """
+    out: list[dict[str, float]] = []
+    for row in timeline or []:
+        if not isinstance(row, dict):
+            continue
+        for face in row.get("faces") or []:
+            if not isinstance(face, dict):
+                continue
+            try:
+                left = float(face.get("left", 0.0)); right = float(face.get("right", 1.0))
+                top = float(face.get("top", 0.0)); bottom = float(face.get("bottom", 1.0))
+            except (TypeError, ValueError):
+                continue
+            if min(left, right) < 0.0 or max(left, right) > 1.0:
+                continue
+            if right - left <= 0.0 or bottom - top <= 0.0:
+                continue
+            out.append({"left": left, "right": right, "top": top, "bottom": bottom})
+    return out
+
+
 def _adaptive_sampling(duration: float, requested: float) -> float:
     req = max(.5, float(requested or .75))
     if duration <= 8 * 60:
@@ -223,7 +265,8 @@ def _provider_from_config(config):
 
 
 def detect_face_focus(path, start=0.0, end=None, sample_seconds=.75, max_samples=None,
-                      mode="Smart", transcript=None, ai_config=None, evidence_out=None, visual_context=None, progress_cb=None):
+                      mode="Smart", transcript=None, ai_config=None, evidence_out=None, visual_context=None, progress_cb=None,
+                      split_out=None):
     try:
         import cv2
     except Exception as exc:
@@ -290,6 +333,10 @@ def detect_face_focus(path, start=0.0, end=None, sample_seconds=.75, max_samples
     speaker_track: dict[str, dict[int, float]] = {}
     raw: list[FocusPoint] = []
     timeline: list[dict[str, Any]] = []
+    # Cheap two-feed composition probe: it only reads the frames this loop
+    # already decodes, and it is consulted exclusively by the split-screen
+    # planning below (legacy modes never look at it).
+    layout_probe = LayoutProbe() if mode in (SPLIT_TWO_PERSON, SPLIT_MULTI_FOCUS) else None
 
     try:
         for idx in range(target_samples):
@@ -312,6 +359,8 @@ def detect_face_focus(path, start=0.0, end=None, sample_seconds=.75, max_samples
                 continue
 
             current_frame = max(current_frame, desired_frame)
+            if layout_probe is not None:
+                layout_probe.add(frame, t - start)
             oh, ow = frame.shape[:2]
             long_form_width = 768.0 if duration >= 8 * 60 else 960.0
             if duration >= 20 * 60:
@@ -364,7 +413,7 @@ def detect_face_focus(path, start=0.0, end=None, sample_seconds=.75, max_samples
                 if pairs and (len(pairs) == 1 or pairs[0][1] >= max(.01, pairs[1][1]) * 1.22):
                     mapped_tid = pairs[0][0]
 
-            if mode in ("Smart", "Speaker Focus", "AI Camera Director") and visible:
+            if mode in TRACKING_MODES and visible:
                 best = visible[0]
                 if len(visible) > 1:
                     face_visible = next((c for c in visible if c.get("kind") == "face"), None)
@@ -460,6 +509,26 @@ def detect_face_focus(path, start=0.0, end=None, sample_seconds=.75, max_samples
     finally:
         cap.release()
 
+    layout_only: dict[str, Any] | None = None
+    if not raw and layout_probe is not None and layout_probe.frames:
+        # A two-feed source needs no tracked face for the split layouts: the
+        # composition itself provides both panels. A flat centre path keeps the
+        # (unused) legacy base framing valid instead of aborting the analysis.
+        layout_only = layout_probe.analyze()
+        if layout_only:
+            for idx in range(target_samples):
+                t = min(end, start + idx * sample_step)
+                raw.append(FocusPoint(t=t - start, x=.5, y=.45, source="layout-only", confidence=.35,
+                                      shot="fit", reason="two-feed source without tracked faces"))
+    if not raw and mode in (SPLIT_TWO_PERSON, SPLIT_MULTI_FOCUS):
+        # A split mode is an explicit user choice and its composition needs no
+        # subject: a flat centre path keeps the (unused) base framing valid while
+        # the split planning below turns the frame into the guaranteed panel
+        # pair, instead of aborting the analysis on a face-less source.
+        for idx in range(max(1, target_samples)):
+            t = min(end, start + idx * sample_step)
+            raw.append(FocusPoint(t=t - start, x=.5, y=.45, source="split-fallback", confidence=.2,
+                                  shot="fit", reason="no faces: split mode uses the frame halves"))
     if not raw:
         raise RuntimeError("Tidak ada wajah yang terdeteksi sepanjang timeline")
 
@@ -499,6 +568,107 @@ def detect_face_focus(path, start=0.0, end=None, sample_seconds=.75, max_samples
             # then generates a bounded move and locks the new shot.
             raw_dict = apply_ai_shots(raw_dict, ai_shots, timeline=timeline, source_aspect=float(meta.width or 16) / max(1.0, float(meta.height or 9)), target_aspect=target_aspect)
 
+    # Split-screen planning. This is additive evidence: the legacy single-panel
+    # points above stay exactly as they are and are still used by every other
+    # framing mode. Both compositions are planned in analysis-relative time,
+    # because the timeline rows are relative to ``start``.
+    split_info: dict[str, Any] = {
+        "mode": mode if mode in (SPLIT_TWO_PERSON, SPLIT_MULTI_FOCUS) else "",
+        "panel_plan": [],
+        "reaction_windows": [],
+        "degraded": False,
+        # True once the permanent split published its two panels, whatever the
+        # detection found (the mode itself guarantees the pair).
+        "guaranteed": False,
+        "tracked_people": 0,
+        "source": "",
+        "reason": "",
+        "layout": {},
+        "range_start": float(start),
+        "range_end": float(end),
+    }
+    try:
+        layout = layout_only if layout_only is not None else (
+            layout_probe.analyze() if layout_probe is not None else None)
+        tracked_plan = [p for p in panel_plan_for_range(timeline, start=0.0, end=duration) if p]
+        layout_used = bool(layout) and len(tracked_plan) < 2
+        if layout_used:
+            # Two-feed composition without enough tracked people: publish the
+            # measured per-feed rows so the export, the reaction rule and the
+            # LIVE PREVIEW all see the two feeds instead of an empty timeline.
+            layout_rows = layout_probe.timeline(layout["split_x"], duration=duration) if layout_probe else []
+            if layout_rows:
+                timeline.extend(layout_rows)
+        if mode == SPLIT_TWO_PERSON:
+            # Hard guarantee: this mode is an explicit user choice, so two panels
+            # are always published. Only the *source* of the pair varies:
+            # 1. two tracked people (their own close-ups, as before),
+            # 2. the measured two feeds of an already split composition,
+            # 3. otherwise the frame itself (left half on top, right half below).
+            # The legacy single-panel render is never used while this mode is
+            # selected, so the export can no longer silently ignore the choice.
+            panels = panel_plan_for_range(timeline, start=0.0, end=duration)
+            tracked_usable = [p for p in panels if p]
+            if layout_used:
+                # The source is *already* composed of two feeds (OmeTV/Omegle
+                # style calls): one panel per feed, so a missed webcam face can
+                # never block the permanent top/bottom layout.
+                panels = layout_panel_plan(layout["split_x"], start=0.0, end=duration,
+                                           subjects=_layout_subjects(timeline))
+                split_info["source"] = "side-by-side layout"
+                split_info["layout"] = layout
+            elif len(tracked_usable) < 2:
+                panels = forced_panel_plan(
+                    start=0.0, end=duration,
+                    split_x=(layout or {}).get("split_x"),
+                    subjects=_layout_subjects(timeline),
+                )
+                split_info["source"] = "automatic split"
+                if layout:
+                    split_info["layout"] = layout
+            usable = [p for p in panels if p]
+            split_info["panel_plan"] = panels
+            split_info["guaranteed"] = len(usable) >= 2
+            split_info["tracked_people"] = len(tracked_usable)
+            split_info["degraded"] = len(usable) < 2
+            if split_info["source"] == "side-by-side layout":
+                split_info["reason"] = (
+                    "sumber sudah dua feed kiri/kanan: tiap feed menjadi satu panel "
+                    f"(batas x={layout['split_x']:.2f}, keyakinan {layout['confidence']:.2f})")
+            elif split_info["source"] == "automatic split":
+                if len(tracked_usable) == 1:
+                    split_info["reason"] = (
+                        "split permanen aktif — baru satu orang terlacak: panel atas = orang itu, "
+                        "panel bawah = separuh frame lainnya")
+                else:
+                    split_info["reason"] = (
+                        "split permanen aktif — orang belum terdeteksi: panel atas = separuh kiri frame, "
+                        "panel bawah = separuh kanan")
+            elif split_info["degraded"]:
+                split_info["reason"] = "single tracked person (wide context panel)"
+            else:
+                split_info["reason"] = "two-person vertical split"
+        elif mode == SPLIT_MULTI_FOCUS and (timeline or layout):
+            windows = normalize_ai_windows(ai_shots, timeline, start=0.0, end=duration)
+            if not windows:
+                # When the tracker never saw two people the measured per-feed
+                # activity of the two-feed composition drives the windows
+                # (``timeline`` already carries those rows above).
+                if layout_used:
+                    split_info["layout"] = layout
+                windows = reaction_split_windows(timeline, start=0.0, end=duration)
+            split_info["reaction_windows"] = windows
+            split_info["source"] = str((windows[0].get("source") if windows else "") or "")
+            if windows:
+                split_info["reason"] = f"{len(windows)} reaction window(s) di atas framing normal"
+            elif layout:
+                split_info["reason"] = ("sumber sudah dua feed kiri/kanan tanpa momen reaksi: "
+                                        "pakai Two-Person Split Screen untuk panel atas/bawah")
+            else:
+                split_info["reason"] = "tidak ada momen reaksi dua orang bersamaan"
+    except Exception as exc:
+        split_info["reason"] = f"split plan fallback: {str(exc)[:160]}"
+
     if evidence_out is not None:
         evidence_out.clear()
         evidence_out.update({
@@ -509,7 +679,12 @@ def detect_face_focus(path, start=0.0, end=None, sample_seconds=.75, max_samples
             "sample_step": sample_step,
             "target_samples": target_samples,
             "adaptive_framing": any(decide_framing(p.__dict__, source_aspect=float(meta.width or 16) / max(1.0, float(meta.height or 9)), target_aspect=target_aspect).mode == "adaptive_fit" for p in raw),
+            "split": split_info,
         })
+
+    if split_out is not None:
+        split_out.clear()
+        split_out.update(split_info)
 
     if progress_cb:
         progress_cb(100, "Person/Face tracking — subject map siap")

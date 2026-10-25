@@ -145,6 +145,11 @@ def can_send_vision(provider: str, model_id: Any, models_cache: Any = None,
         if not isinstance(row, dict) or not model_matches_scope(row, p, endpoint):
             continue
         mid = str(row.get("id") or row.get("name") or row.get("model") or "").strip().split("/")[-1]
+        # Gateway model IDs may be namespaced (for example, "ag/model").
+        # Keep the legacy basename match for non-Gateway providers so their
+        # existing capability checks do not change.
+        if p == PROVIDER_GATEWAY:
+            mid = str(row.get("id") or row.get("name") or row.get("model") or "").strip()
         if mid == wanted and explicit_vision_status(row) == VISION_VERIFIED:
             return True
     return False

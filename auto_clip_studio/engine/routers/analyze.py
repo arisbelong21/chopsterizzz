@@ -1,6 +1,7 @@
 import asyncio
 import json
 import logging
+import math
 import os
 import re
 import uuid
@@ -35,9 +36,9 @@ from chopster.auto_clip_studio.engine.services.ai_service import (
     list_available_gemini_models,
 )
 from chopster.auto_clip_studio.engine.global_ai import resolve_ai_source
-from chopster.auto_clip_studio.engine.gateway_ai import run_gateway_analysis
 from chopster.auto_clip_studio.engine.services.gdrive_service import (
     download_google_drive_video,
+    gdrive_video_id,
     is_google_drive_url,
 )
 from chopster.auto_clip_studio.engine.services.youtube_service import (
@@ -54,10 +55,308 @@ from chopster.auto_clip_studio.engine.utils.text import (
     extract_video_id,
     lowercase_hashtags_in_string,
     parse_manual_subtitles,
+    resolve_language_override,
     sanitize_first_person_title,
 )
 
 router = APIRouter(tags=["Analyze"])
+
+# ── AI fallback bounds ───────────────────────────────────────────────────────
+# A single retired/busy Gemini model used to be retried for minutes (a hung
+# request took ~140s), so the analysis never finished. These caps keep the
+# whole AI step predictable: per-call timeout, total deadline, model cap, and
+# an in-process cache of models that answered 404 (retired for this key).
+AI_CALL_TIMEOUT_SECONDS = int(os.environ.get("ACS_AI_CALL_TIMEOUT_S", "60") or 60)
+AI_ANALYSIS_DEADLINE_SECONDS = int(os.environ.get("ACS_AI_DEADLINE_S", "180") or 180)
+MAX_MODELS_PER_ANALYSIS = int(os.environ.get("ACS_AI_MAX_MODELS", "5") or 5)
+
+
+def _retired_cache_path() -> Path:
+    try:
+        from chopster.app.paths import user_data_dir
+        base = Path(user_data_dir())
+    except Exception:
+        base = Path(os.environ.get("TEMP") or ".")
+    return base / "acs_retired_models.json"
+
+
+def _load_retired_models() -> set[str]:
+    try:
+        path = _retired_cache_path()
+        if path.exists():
+            data = json.loads(path.read_text(encoding="utf-8"))
+            if isinstance(data, list):
+                return {str(m) for m in data if str(m).strip()}
+    except Exception:
+        pass
+    return set()
+
+
+def _save_retired_models(models: set[str]) -> None:
+    try:
+        path = _retired_cache_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(sorted(models), ensure_ascii=False), encoding="utf-8")
+    except Exception:
+        pass
+
+
+# Retired-for-this-key models, remembered across app restarts so the doomed
+# "gemini-2.5-flash → 404" attempt does not repeat on every launch.
+_UNAVAILABLE_MODELS: set[str] = _load_retired_models()
+
+
+# Only files inside the app-managed media directories may be analyzed. This
+# mirrors routers/media.py::_is_safe_path. A bare `os.path.exists(request.url)`
+# check previously let a caller point ffprobe/Whisper at ANY readable file on
+# disk and stream its transcript back.
+_ANALYZE_ALLOWED_ROOTS = (UPLOADS_DIR, TEMP_DIR)
+
+
+def _is_allowed_analyze_path(candidate: str) -> bool:
+    """True only when `candidate` resolves inside an allowed media directory."""
+    try:
+        resolved = Path(candidate).resolve()
+    except (OSError, ValueError):
+        return False
+    for root in _ANALYZE_ALLOWED_ROOTS:
+        try:
+            root_resolved = root.resolve()
+        except (OSError, ValueError):
+            continue
+        if resolved == root_resolved or resolved.is_relative_to(root_resolved):
+            return True
+    return False
+
+
+def _coerce_model_text(value) -> str:
+    """Normalize text fields from AI providers before string-only processing."""
+    if value is None:
+        return ""
+    if isinstance(value, str):
+        return value.strip()
+    if isinstance(value, (list, tuple)):
+        return " ".join(
+            text for item in value
+            if (text := _coerce_model_text(item))
+        )
+    if isinstance(value, dict):
+        for key in ("text", "content", "value"):
+            if key in value:
+                text = _coerce_model_text(value[key])
+                if text:
+                    return text
+        return json.dumps(value, ensure_ascii=False)
+    return str(value).strip()
+
+
+def _coerce_model_text_list(value) -> list[str]:
+    """Normalize quote fields to the list-of-strings expected by ViralClip."""
+    values = value if isinstance(value, (list, tuple)) else [value]
+    return [
+        text for item in values
+        if (text := _coerce_model_text(item))
+    ]
+
+
+def _coerce_model_int(value, default: int = 0) -> int:
+    """Round numeric model output to the integer required by the response schema."""
+    try:
+        number = float(value)
+    except (TypeError, ValueError, OverflowError):
+        match = re.search(r"[-+]?\d+(?:\.\d+)?", str(value or ""))
+        if not match:
+            return default
+        try:
+            number = float(match.group(0))
+        except (TypeError, ValueError, OverflowError):
+            return default
+    try:
+        return int(round(number))
+    except (ValueError, OverflowError):
+        return default
+
+
+def _normalize_analysis_payload(payload) -> Optional[dict]:
+    """Normalize common Gateway JSON shapes to {summary, clips}."""
+    if isinstance(payload, list):
+        if (
+            len(payload) == 1
+            and isinstance(payload[0], dict)
+            and any(key in payload[0] for key in ("clips", "clip_candidates", "results"))
+        ):
+            payload = payload[0]
+        else:
+            # Some OpenAI-compatible models return the clip objects directly
+            # instead of wrapping them in {"summary": ..., "clips": [...]}.
+            payload = {"summary": "", "clips": payload}
+    if not isinstance(payload, dict):
+        return None
+
+    nested = payload.get("data")
+    if isinstance(nested, dict) and any(key in nested for key in ("clips", "clip_candidates", "results")):
+        payload = nested
+
+    clips = payload.get("clips")
+    if clips is None:
+        for key in ("clip_candidates", "recommendations", "results", "segments"):
+            if key in payload:
+                clips = payload[key]
+                break
+    if isinstance(clips, dict):
+        nested_clips = next(
+            (clips[key] for key in ("clips", "items", "results") if isinstance(clips.get(key), list)),
+            None,
+        )
+        clips = nested_clips if nested_clips is not None else [clips]
+    if clips is None:
+        clips = []
+    if not isinstance(clips, list):
+        return None
+
+    normalized_clips = []
+    for item in clips:
+        if isinstance(item, dict):
+            normalized_clips.append(item)
+        elif isinstance(item, list):
+            normalized_clips.extend(clip for clip in item if isinstance(clip, dict))
+
+    return {
+        "summary": _coerce_model_text(
+            _first_model_value(payload, "summary", "video_summary", "overview")
+        ),
+        "clips": normalized_clips,
+    }
+
+
+def _first_model_value(values: dict, *keys):
+    for key in keys:
+        if key in values and values[key] is not None:
+            return values[key]
+    return None
+
+
+def _coerce_model_seconds(value) -> Optional[float]:
+    """Read seconds from numeric or common timestamp-shaped model output."""
+    if value is None or isinstance(value, bool):
+        return None
+    if isinstance(value, dict):
+        for key in ("seconds", "time", "value"):
+            if key in value:
+                return _coerce_model_seconds(value[key])
+        return None
+    try:
+        seconds = float(value)
+    except (TypeError, ValueError, OverflowError):
+        text = str(value).strip()
+        if ":" in text:
+            try:
+                parts = [float(part) for part in text.split(":")]
+                if len(parts) == 2:
+                    seconds = parts[0] * 60 + parts[1]
+                elif len(parts) == 3:
+                    seconds = parts[0] * 3600 + parts[1] * 60 + parts[2]
+                else:
+                    return None
+            except (TypeError, ValueError, OverflowError):
+                return None
+        else:
+            match = re.search(r"[-+]?\d+(?:\.\d+)?", text)
+            if not match:
+                return None
+            try:
+                seconds = float(match.group(0))
+            except (TypeError, ValueError, OverflowError):
+                return None
+    if not math.isfinite(seconds) or seconds < 0:
+        return None
+    return seconds
+
+
+def _match_quote_to_transcript(quote: str, transcript: list[dict]) -> Optional[tuple[float, float, int]]:
+    """Find an exact, normalized quote in timed transcript lines."""
+    word_pattern = r"[^\W_]+"
+    quote_tokens = re.findall(word_pattern, quote.casefold(), flags=re.UNICODE)
+    if len(quote_tokens) < 3:
+        return None
+
+    timed_tokens = []
+    for line in transcript:
+        try:
+            line_start = float(line.get("start", 0.0))
+            line_end = float(line.get("end", 0.0))
+        except (TypeError, ValueError, OverflowError):
+            continue
+        if not math.isfinite(line_start) or not math.isfinite(line_end) or line_end <= line_start:
+            continue
+        text = _coerce_model_text(line.get("text", ""))
+        for token in re.findall(word_pattern, text.casefold(), flags=re.UNICODE):
+            timed_tokens.append((token, line_start, line_end))
+
+    width = len(quote_tokens)
+    for index in range(0, len(timed_tokens) - width + 1):
+        if [entry[0] for entry in timed_tokens[index:index + width]] == quote_tokens:
+            return (
+                timed_tokens[index][1],
+                timed_tokens[index + width - 1][2],
+                width,
+            )
+    return None
+
+
+def _recover_clip_times(raw_clip: dict, transcript: list[dict], duration: str,
+                        range_start: float, range_end: float) -> Optional[tuple[float, float]]:
+    """Recover omitted/zero AI timestamps by matching key quotes to timed subtitles."""
+    quotes = _coerce_model_text_list(raw_clip.get("key_quotes"))
+    matches = [
+        match for quote in quotes
+        if (match := _match_quote_to_transcript(quote, transcript))
+    ]
+    if not matches:
+        return None
+
+    # Prefer the longest exact match. Nearby quotes from the same clip can widen
+    # its boundaries, but distant quote matches should not create a huge segment.
+    anchor = max(matches, key=lambda item: item[2])
+    quote_start, quote_end, _ = anchor
+    nearby = [
+        item for item in matches
+        if abs(item[0] - quote_start) <= 45.0
+    ]
+    if nearby:
+        quote_start = min(item[0] for item in nearby)
+        quote_end = max(item[1] for item in nearby)
+
+    desired = {"15s": 15.0, "30s": 30.0, "60s": 60.0}.get(
+        str(duration or "").lower(),
+        max(30.0, quote_end - quote_start),
+    )
+    desired = min(max(desired, quote_end - quote_start), max(0.1, range_end - range_start))
+    clip_start = max(range_start, quote_start - max(0.0, desired - (quote_end - quote_start)) / 2)
+    clip_end = min(range_end, clip_start + desired)
+    clip_start = max(range_start, clip_end - desired)
+
+    # Snap outward to available subtitle sentence boundaries while keeping the
+    # matched quote inside the recovered range.
+    starts = []
+    ends = []
+    for line in transcript:
+        try:
+            line_start = float(line.get("start", 0.0))
+            line_end = float(line.get("end", 0.0))
+        except (TypeError, ValueError, OverflowError):
+            continue
+        if range_start <= line_start <= min(clip_start, quote_start):
+            starts.append(line_start)
+        if max(clip_end, quote_end) >= line_end >= quote_end:
+            ends.append(line_end)
+    if starts:
+        clip_start = max(starts)
+    if ends:
+        clip_end = max(ends)
+    if clip_end <= clip_start:
+        return None
+    return round(clip_start, 2), round(clip_end, 2)
 
 
 @router.get("/api/health")
@@ -132,6 +431,10 @@ async def analyze_video(request: AnalyzeRequest):
 
         # ── Step 1: Detect Source Type & Extract Metadata ───────────────────
         req_clean = request.url.strip()
+        # User-selected output language. 'auto'/None keeps the default behaviour (match the
+        # video's own spoken language); any ISO code forces titles, hooks, captions, hashtags
+        # and the Whisper spoken-language hint to that language.
+        language_override = resolve_language_override(request.language)
         is_uploaded = False
         is_gdrive = is_google_drive_url(req_clean)
         uploaded_file_path: Optional[Path] = None
@@ -176,7 +479,7 @@ async def analyze_video(request: AnalyzeRequest):
             except Exception as e:
                 yield _sse({"error": f"Failed to fetch video from Google Drive: {str(e)}", "status": 400})
                 return
-        elif req_clean.startswith("upload_") or req_clean.startswith("/api/video/") or req_clean.startswith("file://") or os.path.exists(req_clean):
+        elif req_clean.startswith("upload_") or req_clean.startswith("/api/video/") or req_clean.startswith("file://") or _is_allowed_analyze_path(req_clean):
             is_uploaded = True
         elif (UPLOADS_DIR / os.path.basename(req_clean.split("?")[0])).exists():
             is_uploaded = True
@@ -187,7 +490,7 @@ async def analyze_video(request: AnalyzeRequest):
 
         if is_uploaded:
             if uploaded_file_path is None:
-                if os.path.exists(req_clean):
+                if _is_allowed_analyze_path(req_clean):
                     uploaded_file_path = Path(req_clean)
                 elif (UPLOADS_DIR / os.path.basename(req_clean.split("?")[0])).exists():
                     uploaded_file_path = UPLOADS_DIR / os.path.basename(req_clean.split("?")[0])
@@ -202,6 +505,11 @@ async def analyze_video(request: AnalyzeRequest):
                         return
 
             video_id = uploaded_file_path.stem
+            if is_gdrive:
+                # The stored file carries a random download tag; the UI derives the
+                # Drive link and the history cache key from video_id, so keep the
+                # identity stable (tag-free) while video_url keeps the real filename.
+                video_id = gdrive_video_id(req_clean, uploaded_file_path.stem) or video_id
             canonical_url = req_clean if is_gdrive else f"/api/video/{uploaded_file_path.name}"
             video_url = f"/api/video/{uploaded_file_path.name}"
             source_type = "gdrive" if is_gdrive else "upload"
@@ -217,7 +525,9 @@ async def analyze_video(request: AnalyzeRequest):
 
             try:
                 metadata = await asyncio.to_thread(get_video_file_metadata, uploaded_file_path)
-                title = metadata.get("title") or (uploaded_file_path.stem.replace("gdrive_", "GDrive: ") if is_gdrive else uploaded_file_path.stem)
+                title = metadata.get("title") or (
+                    f"GDrive: {video_id[len('gdrive_'):]}" if is_gdrive else uploaded_file_path.stem
+                )
                 channel = "Google Drive" if is_gdrive else "Local Upload"
                 duration = metadata.get("duration", 0.0)
                 is_live = False
@@ -317,7 +627,12 @@ async def analyze_video(request: AnalyzeRequest):
 
                 try:
                     task = asyncio.create_task(
-                        asyncio.to_thread(transcribe_local_video_file, uploaded_file_path, whisper_progress)
+                        asyncio.to_thread(
+                            transcribe_local_video_file,
+                            uploaded_file_path,
+                            whisper_progress,
+                            language_override['code'] if language_override else None
+                        )
                     )
                     while not task.done():
                         try:
@@ -386,6 +701,14 @@ async def analyze_video(request: AnalyzeRequest):
             })
 
             channel = ""
+            spoken_lang_hint = ""
+            # Resolved ONCE at the YouTube-scope level (NOT inside the transcript try block) so
+            # the Whisper fallback below can always read it. It used to be assigned only inside a
+            # `try:` that may fail, which made the fallback reference an unbound name (NameError)
+            # and crash the whole analysis whenever subtitles were unavailable.
+            preferred_transcript_lang = (
+                language_override['code'] if language_override else (spoken_lang_hint or None)
+            )
             try:
                 metadata = await asyncio.to_thread(fetch_video_metadata, canonical_url, request.proxy)
                 title    = metadata["title"]
@@ -394,6 +717,13 @@ async def analyze_video(request: AnalyzeRequest):
                 heatmap  = metadata.get("heatmap") or []
                 is_live  = metadata.get("is_live", False)
                 live_status = metadata.get("live_status", "not_live")
+                # YouTube's own declared audio language (e.g. 'id'). Used as a spoken-language
+                # hint for transcript selection and local Whisper, so an Indonesian video is not
+                # silently captioned and hooked in English.
+                spoken_lang_hint = str(metadata.get("audio_language") or "").strip().lower().split("-")[0]
+                preferred_transcript_lang = (
+                    language_override['code'] if language_override else (spoken_lang_hint or None)
+                )
                 yield _sse({
                     "step": 1,
                     "step_progress": 100,
@@ -504,8 +834,19 @@ async def analyze_video(request: AnalyzeRequest):
 
                 transcript_error = None
                 try:
+                    # Language preference for transcript tiers. `preferred_transcript_lang` was
+                    # already resolved once at YouTube-scope level above (user's explicit choice
+                    # wins, otherwise YouTube's declared audio language is used as a hint), so it
+                    # is intentionally NOT reassigned here — the Whisper fallback reads the same
+                    # scope-level value.
                     task = asyncio.create_task(
-                        asyncio.to_thread(fetch_transcript, video_id, request.proxy, progress_callback)
+                        asyncio.to_thread(
+                            fetch_transcript,
+                            video_id,
+                            request.proxy,
+                            progress_callback,
+                            preferred_transcript_lang
+                        )
                     )
 
                     while not task.done():
@@ -600,7 +941,10 @@ async def analyze_video(request: AnalyzeRequest):
                                 })
 
                             whisper_task = asyncio.create_task(asyncio.to_thread(
-                                transcribe_local_video_file, temp_audio, whisper_progress
+                                transcribe_local_video_file,
+                                temp_audio,
+                                whisper_progress,
+                                preferred_transcript_lang
                             ))
                             while not whisper_task.done():
                                 try:
@@ -672,8 +1016,67 @@ async def analyze_video(request: AnalyzeRequest):
                 yield _sse({"error": f"No subtitles found in the specified range {start_bound}s to {end_bound}s.", "status": 400})
                 return
             
-            duration = end_bound - start_bound
-            logger.info(f"Filtered transcript to custom range: {start_bound}s to {end_bound}s (duration: {duration}s)")
+            # Keep `duration` as the FULL video length. Clips, mock synthesis and
+            # the fallback generator all clamp absolute transcript timestamps
+            # against `duration` as an absolute end bound; overwriting it with the
+            # range span made `end < start` clips that rendered as 1-second blips.
+            logger.info(
+                "Filtered transcript to custom range: %ss to %ss (span: %ss)",
+                start_bound, end_bound, end_bound - start_bound,
+            )
+
+        # ── Fallback heatmap ────────────────────────────────────────────────
+        # YouTube does not expose a most-replayed curve for every video
+        # (log: heatmap_pts=0), which left the analysis graph empty. Build a
+        # dialogue-activity curve from the transcript so the timeline always
+        # shows data and the AI prompt receives engagement hints.
+        if not heatmap and transcript_lines:
+            try:
+                total = float(duration or 0.0)
+                if total <= 0:
+                    total = max(
+                        (float(l.get("start", 0.0) or 0.0)
+                         + float(l.get("duration", 0.0) or 0.0) for l in transcript_lines),
+                        default=0.0)
+                if total > 0:
+                    buckets = 120
+                    step = max(1.0, total / buckets)
+                    weights = [0.0] * buckets
+                    for line in transcript_lines:
+                        ls = float(line.get("start", 0.0) or 0.0)
+                        ldur = float(line.get("duration", 0.0) or 0.0)
+                        words = len(str(line.get("text", "")).split())
+                        if words <= 0 or ldur <= 0:
+                            continue
+                        density = words / max(0.5, ldur)
+                        first = int(ls // step)
+                        last = int(max(ls, ls + ldur - 1e-6) // step)
+                        for bi in range(max(0, first), min(buckets - 1, last) + 1):
+                            weights[bi] += density
+                    smoothed = []
+                    for i in range(buckets):
+                        lo, hi = max(0, i - 2), min(buckets, i + 3)
+                        smoothed.append(sum(weights[lo:hi]) / (hi - lo))
+                    peak = max(smoothed) or 1.0
+                    heatmap = [
+                        {"start_time": round(i * step, 2),
+                         "end_time": round(min(total, (i + 1) * step), 2),
+                         "value": round(min(1.0, 0.25 + 0.75 * (v / peak)), 4)}
+                        for i, v in enumerate(smoothed)
+                    ]
+                    logger.info("Synthetic dialogue heatmap built: %d points", len(heatmap))
+                    yield _sse({
+                        "step": 2,
+                        "step_progress": 100,
+                        "overall_progress": 50,
+                        "stage": "Dialogue Activity Curve",
+                        "detail": ("YouTube tidak menyediakan data most-replayed — "
+                                   f"grafik dibuat dari aktivitas dialog ({len(heatmap)} titik)."),
+                        "message": "Grafik analisis dibuat dari aktivitas dialog.",
+                        "warning": True,
+                    })
+            except Exception as exc:
+                logger.warning("Synthetic dialogue heatmap failed: %s", exc)
 
         # Enrich transcript with heatmap engagement scores
         enriched_transcript = []
@@ -831,9 +1234,43 @@ async def analyze_video(request: AnalyzeRequest):
 
         # ── Step 4: Build prompt & Detect Language ─────────────────────────────
         detected_lang = detect_transcript_language(enriched_transcript, title)
-        lang_code = detected_lang.get('code', 'en')
-        lang_name = detected_lang.get('name', 'English')
-        logger.info(f"Detected video language: {lang_name} ({lang_code}) - confidence {detected_lang.get('confidence', 0.0)}")
+        # A user-selected language always wins. Otherwise the detector is only trusted when it is
+        # confident: a weak verdict must never be forced into English, the model then decides the
+        # language from the dialogue itself (this is what used to make Indonesian videos English).
+        if language_override:
+            lang_code = language_override['code']
+            lang_name = language_override['name']
+            language_forced = True
+            language_source = "user-selected"
+        else:
+            detected_code = detected_lang.get('code') or 'auto'
+            if bool(detected_lang.get('uncertain')) or detected_code == 'auto':
+                lang_code = 'auto'
+                lang_name = "the video's own spoken language"
+                language_forced = False
+                language_source = "self-detect (detector inconclusive)"
+            else:
+                lang_code = detected_code
+                lang_name = detected_lang.get('name') or detected_code.upper()
+                language_forced = True
+                language_source = "auto-detected"
+        # Concrete code used when sanitising titles. sanitize_first_person_title only needs it to
+        # pick a default subject noun. Prefer the forced/effective lang_code; when the detector was
+        # inconclusive (lang_code == 'auto'), fall back to the detector's best guess so the subject
+        # noun matches the dialogue's likely language instead of hardcoding English ("The Speaker").
+        title_lang_code = (
+            lang_code if lang_code not in (None, '', 'auto')
+            else (detected_lang.get('code') if detected_lang.get('code') not in (None, '', 'auto') else 'en')
+        )
+        lang_label = lang_name.upper() if language_forced else "THE VIDEO'S OWN SPOKEN LANGUAGE"
+        language_header = (
+            f"{lang_name} (Code: '{lang_code}')" if language_forced
+            else "AUTO-DETECT (the automatic detector was inconclusive - the AI must decide from the transcript)"
+        )
+        logger.info(
+            f"Output language: {language_source} -> {lang_name} ({lang_code}) | detector={detected_lang.get('code')} "
+            f"confidence={detected_lang.get('confidence')} uncertain={detected_lang.get('uncertain')}"
+        )
 
         transcript_dump = []
         for line in enriched_transcript:
@@ -872,7 +1309,39 @@ async def analyze_video(request: AnalyzeRequest):
                 f"CRITICAL USER SEARCH FOCUS:\n"
                 f"The user specifically wants you to find clips matching the following query/theme: \"{request.custom_prompt.strip()}\".\n"
                 f"Prioritize and tailor your selection of viral clips to fit this request, while still ensuring they make good standalone clips.\n"
-                f"IMPORTANT: Regardless of the language this query was typed in, your generated titles, summaries, quotes, and captions MUST REMAIN IN THE VIDEO'S SPOKEN LANGUAGE ({lang_name}). DO NOT translate the video's content to match the language of the search query.\n\n"
+                f"IMPORTANT: Regardless of the language this query was typed in, your generated titles, summaries, quotes, and captions MUST REMAIN IN {lang_label}. DO NOT translate the video's content to match the language of the search query.\n\n"
+            )
+
+        if language_forced:
+            language_block = (
+                f"================================================================================\n"
+                f"CRITICAL MANDATORY LANGUAGE RULE (ZERO TRANSLATION):\n"
+                f"================================================================================\n"
+                f"THE REQUIRED OUTPUT LANGUAGE IS: {lang_label} (Language Code: '{lang_code}').\n"
+                f"YOU MUST GENERATE 100% OF ALL CONTENT STRICTLY AND EXCLUSIVELY IN {lang_label}.\n\n"
+                f"1. NEVER TRANSLATE TO ANY OTHER LANGUAGE!\n"
+                f"   - Every title, title suggestion, summary, caption, hashtag and key quote MUST BE 100% IN {lang_label}.\n"
+                f"   - Even if the user's prompt or search query was written in another language, your output MUST REMAIN 100% IN {lang_label}.\n"
+                f"2. Strict field requirements in {lang_label}:\n"
+                f"   - `summary`: In {lang_label}.\n"
+                f"   - `title`: Catchy title in {lang_label}, max 8 words.\n"
+                f"   - `title_suggestion`: Alternative title in {lang_label}.\n"
+                f"   - `caption_suggestion`: Engaging social caption in {lang_label}.\n"
+                f"   - `hashtag_suggestion`: Relevant hashtags in {lang_label}.\n"
+                f"   - `key_quotes`: MUST be verbatim spoken quotes directly from the transcript in {lang_label}.\n"
+                f"================================================================================\n\n"
+            )
+        else:
+            language_block = (
+                f"================================================================================\n"
+                f"CRITICAL MANDATORY LANGUAGE RULE (SELF-DETECT, ZERO TRANSLATION):\n"
+                f"================================================================================\n"
+                f"The automatic language detector was NOT confident about this video, so YOU must determine the main spoken language yourself from the transcript dialogue below and write 100% of your output in that SAME language.\n\n"
+                f"1. NEVER TRANSLATE the video's spoken language into another language.\n"
+                f"2. NEVER DEFAULT TO ENGLISH. Only use English when the dialogue itself is genuinely English.\n"
+                f"3. If the dialogue mixes languages, follow the language used by the majority of complete sentences (an Indonesian host dropping English slang words still means Indonesian output).\n"
+                f"4. `summary`, `title`, `title_suggestion`, `caption_suggestion`, `hashtag_suggestion` and `key_quotes` MUST all use that detected spoken language, and `key_quotes` must stay verbatim from the transcript.\n"
+                f"================================================================================\n\n"
             )
 
         channel_context = f"- Channel / Host / Creator: {channel}\n" if channel else ""
@@ -883,27 +1352,11 @@ async def analyze_video(request: AnalyzeRequest):
             f"VIDEO CONTEXT:\n"
             f"- Video Title: {title}\n"
             f"{channel_context}"
-            f"- Video Duration: {int(start_bound)}s to {int(end_bound)}s (Total: {int(duration)}s) | Target clip length: {dur_range}\n"
+            f"- Video Duration: {int(start_bound)}s to {int(end_bound)}s (Total: {int(max(0.0, end_bound - start_bound))}s) | Target clip length: {dur_range}\n"
             f"- Heatmap: {heatmap_note}\n"
-            f"- DETECTED VIDEO SPOKEN LANGUAGE: {lang_name} (Code: '{lang_code}')\n\n"
-            f"================================================================================\n"
-            f"CRITICAL MANDATORY LANGUAGE RULE (ZERO TRANSLATION):\n"
-            f"================================================================================\n"
-            f"THE MAIN SPOKEN LANGUAGE OF THIS VIDEO IS: {lang_name.upper()} (Language Code: '{lang_code}').\n"
-            f"YOU MUST GENERATE 100% OF ALL CONTENT STRICTLY AND EXCLUSIVELY IN {lang_name.upper()}.\n\n"
-            f"1. NEVER TRANSLATE TO ANY OTHER LANGUAGE!\n"
-            f"   - If the video is in English -> ALL titles, title suggestions, summaries, captions, hashtags, and quotes MUST BE 100% IN ENGLISH. Do NOT write Indonesian, Spanish, or any other language!\n"
-            f"   - If the video is in Indonesian -> ALL titles, title suggestions, summaries, captions, hashtags, and quotes MUST BE 100% IN INDONESIAN. Do NOT write English or any other language!\n"
-            f"   - If the video is in another language -> ALL output MUST strictly match that language.\n"
-            f"   - Even if the user's prompt or search query was written in another language, your output MUST REMAIN 100% IN {lang_name.upper()}.\n"
-            f"2. Strict field requirements in {lang_name.upper()}:\n"
-            f"   - `summary`: In {lang_name.upper()}.\n"
-            f"   - `title`: Catchy title in {lang_name.upper()}, max 8 words.\n"
-            f"   - `title_suggestion`: Alternative title in {lang_name.upper()}.\n"
-            f"   - `caption_suggestion`: Engaging social caption in {lang_name.upper()}.\n"
-            f"   - `hashtag_suggestion`: Relevant hashtags in {lang_name.upper()}.\n"
-            f"   - `key_quotes`: MUST be verbatim spoken quotes directly from the transcript in {lang_name.upper()}.\n"
-            f"================================================================================\n\n"
+            f"- DETECTED VIDEO SPOKEN LANGUAGE: {language_header}\n"
+            f"- OUTPUT LANGUAGE MODE: {language_source}\n\n"
+            f"{language_block}"
             f"{duration_instruction}\n\n"
             f"{clip_count_instruction}\n\n"
             f"{focus_instruction}"
@@ -942,17 +1395,20 @@ async def analyze_video(request: AnalyzeRequest):
             models_to_try = [requested_model] if requested_model else [""]
             client = None
         else:
-            # Gemini/Google route: dynamic Flash fallback models and retry.
+            # Gemini/Google route: use the already-selected model first and
+            # keep a small local fallback list. If the selected model is
+            # retired/unavailable, refresh Google's live Flash list on demand
+            # rather than adding a paginated network request to every success.
             client = genai.Client(api_key=gemini_key)
-            discovered_flash = await asyncio.to_thread(get_flash_models_for_key, client)
-            models_to_try = [requested_model]
-            for fm in discovered_flash:
-                if fm not in models_to_try:
-                    models_to_try.append(fm)
+            models_to_try = [requested_model] if requested_model else []
             for km in KNOWN_FLASH_MODELS:
                 if km not in models_to_try:
                     models_to_try.append(km)
 
+        # Skip models already known-retired for this key and cap the chain so a
+        # long fallback list can never multiply into a multi-minute wait.
+        models_to_try = [m for m in models_to_try
+                         if m and m not in _UNAVAILABLE_MODELS][:MAX_MODELS_PER_ANALYSIS]
         logger.info(f"Flash fallback chain prepared: {models_to_try}")
 
         response = None
@@ -960,22 +1416,43 @@ async def analyze_video(request: AnalyzeRequest):
         encountered_quota_error = None
         analysis_data = None
         successful_model = None
+        gemini_models_refreshed = False
+        analysis_started = asyncio.get_event_loop().time()
 
         for idx, model_name in enumerate(models_to_try):
+            if (asyncio.get_event_loop().time() - analysis_started
+                    >= AI_ANALYSIS_DEADLINE_SECONDS):
+                logger.warning(
+                    "AI analysis deadline (%ss) hit before %s; stopping fallback chain",
+                    AI_ANALYSIS_DEADLINE_SECONDS, model_name)
+                last_error = last_error or Exception(
+                    f"AI deadline {AI_ANALYSIS_DEADLINE_SECONDS}s exceeded")
+                break
             next_model_hint = models_to_try[idx + 1] if idx + 1 < len(models_to_try) else None
             MAX_RETRIES = 2
             
             for attempt in range(MAX_RETRIES):
                 if attempt > 0:
                     wait = 2
+                    previous_error = str(last_error or "").lower()
+                    is_empty_gateway_retry = use_gateway and any(
+                        marker in previous_error
+                        for marker in ("respons kosong", "empty response", "unparseable response")
+                    )
+                    retry_detail = (
+                        f"{model_name} returned no usable text/JSON; retrying in {wait}s "
+                        f"({attempt + 1}/{MAX_RETRIES})..."
+                        if is_empty_gateway_retry else
+                        f"{model_name} busy — waiting {wait}s before retry ({attempt + 1}/{MAX_RETRIES})..."
+                    )
                     yield _sse({
                         "step": 4,
                         "step_progress": 25,
                         "overall_progress": 75,
-                        "stage": "Transient Retry",
-                        "detail": f"{model_name} busy — waiting {wait}s before retry ({attempt + 1}/{MAX_RETRIES})...",
+                        "stage": "Gateway Response Retry" if is_empty_gateway_retry else "Transient Retry",
+                        "detail": retry_detail,
                         "model": model_name,
-                        "message": f"{model_name} is busy — waiting {wait}s before retry {attempt + 1}/{MAX_RETRIES}..."
+                        "message": retry_detail
                     })
                     await asyncio.sleep(wait)
                 
@@ -991,10 +1468,11 @@ async def analyze_video(request: AnalyzeRequest):
                 
                 # Execute AI call with heartbeat to keep mobile connection alive and show live stages
                 if use_gateway:
+                    from chopster.auto_clip_studio.engine.gateway_ai import run_gateway_analysis
                     task = asyncio.create_task(asyncio.to_thread(
                         run_gateway_analysis,
                         gateway_ctx, prompt, model_name,
-                        (65536 if any(v in model_name for v in ['2.0', '2.5', '3.']) else 8192),
+                        32768,
                     ))
                 else:
                     task = asyncio.create_task(asyncio.to_thread(
@@ -1010,10 +1488,20 @@ async def analyze_video(request: AnalyzeRequest):
                     ))
                 
                 call_start = asyncio.get_event_loop().time()
+                call_timed_out = False
                 while not task.done():
                     done, _ = await asyncio.wait([task], timeout=2.0)
                     if not done:
                         elapsed = int(asyncio.get_event_loop().time() - call_start)
+
+                        # Hard per-call cap: a hung request must not stall the
+                        # whole analysis (previously ~140s on one model).
+                        if elapsed >= AI_CALL_TIMEOUT_SECONDS:
+                            call_timed_out = True
+                            logger.warning(
+                                "%s exceeded the %ss per-call timeout; moving on",
+                                model_name, AI_CALL_TIMEOUT_SECONDS)
+                            break
                         
                         if elapsed < 5:
                             stage = "Neural Context Loading"
@@ -1055,6 +1543,9 @@ async def analyze_video(request: AnalyzeRequest):
                         })
                 
                 try:
+                    if call_timed_out:
+                        raise TimeoutError(
+                            f"{model_name} timed out after {AI_CALL_TIMEOUT_SECONDS}s")
                     resp_candidate = await task
                     last_error = None
                     
@@ -1066,13 +1557,13 @@ async def analyze_video(request: AnalyzeRequest):
                             "summary": getattr(parsed, 'summary', ''),
                             "clips": [
                                 {
-                                    "title": sanitize_first_person_title(getattr(c, 'title', ''), channel, lang=lang_code),
+                                    "title": sanitize_first_person_title(getattr(c, 'title', ''), channel, lang=title_lang_code),
                                     "start_time": getattr(c, 'start_time', 0.0),
                                     "end_time": getattr(c, 'end_time', 0.0),
                                     "hook_time": getattr(c, 'hook_time', None),
                                     "virality_score": getattr(c, 'virality_score', 0),
                                     "key_quotes": getattr(c, 'key_quotes', []),
-                                    "title_suggestion": sanitize_first_person_title(getattr(c, 'title_suggestion', ''), channel, lang=lang_code),
+                                    "title_suggestion": sanitize_first_person_title(getattr(c, 'title_suggestion', ''), channel, lang=title_lang_code),
                                     "caption_suggestion": getattr(c, 'caption_suggestion', ''),
                                     "hashtag_suggestion": getattr(c, 'hashtag_suggestion', ''),
                                 }
@@ -1089,6 +1580,22 @@ async def analyze_video(request: AnalyzeRequest):
                         except Exception as json_err:
                             logger.warning(f"JSON parsing error from {model_name}: {json_err}")
                             parsed_data = None
+
+                    if parsed_data is not None and use_gateway:
+                        original_payload_type = type(parsed_data).__name__
+                        parsed_data = _normalize_analysis_payload(parsed_data)
+                        if parsed_data is None:
+                            logger.warning(
+                                "%s returned unsupported JSON payload shape (%s)",
+                                model_name,
+                                original_payload_type,
+                            )
+                        elif original_payload_type == "list":
+                            logger.info(
+                                "%s top-level clip list normalized (%d clips)",
+                                model_name,
+                                len(parsed_data.get("clips", [])),
+                            )
 
                     if parsed_data is not None:
                         clips_found = len(parsed_data.get('clips', []))
@@ -1112,18 +1619,101 @@ async def analyze_video(request: AnalyzeRequest):
                         break
                     else:
                         last_error = Exception(f"{model_name} returned empty or unparseable response")
+                        if use_gateway and attempt + 1 < MAX_RETRIES:
+                            logger.warning(
+                                "%s returned empty or invalid JSON; retrying once",
+                                model_name,
+                            )
+                            continue
                         break
                         
                 except Exception as e:
                     last_error = e
                     err_str = str(e).lower()
                     logger.warning(f"Error from {model_name} (attempt {attempt + 1}): {e}")
+
+                    # Gateway requests can time out transiently while the remote
+                    # model is generating. Retry this only on the ACS Gateway
+                    # route, using the existing one-retry limit; do not change
+                    # Gemini or shared AI-provider retry behavior.
+                    is_gateway_timeout = use_gateway and any(
+                        marker in err_str
+                        for marker in ("read operation timed out", "timed out", "timeout")
+                    )
+                    if is_gateway_timeout:
+                        if attempt + 1 < MAX_RETRIES:
+                            logger.warning(
+                                "%s timed out through the ACS Gateway; retrying once",
+                                model_name,
+                            )
+                            continue
+                        break
+
+                    is_empty_gateway_response = use_gateway and any(
+                        marker in err_str
+                        for marker in ("respons kosong", "empty response", "unparseable response")
+                    )
+                    if is_empty_gateway_response:
+                        # A deterministic output-token cutoff cannot be fixed
+                        # by replaying the identical request and wastes another
+                        # full model-generation round trip.
+                        is_gateway_output_limit = "finish_reason=length" in err_str
+                        if attempt + 1 < MAX_RETRIES and not is_gateway_output_limit:
+                            logger.warning("%s returned no usable response; retrying once", model_name)
+                            continue
+                        break
                     
                     if any(x in err_str for x in ('429', 'quota', 'resource exhausted', 'rate limit')):
                         encountered_quota_error = e
                         break
 
                     if any(x in err_str for x in ('404', 'not found', 'not supported')):
+                        # Retired for this key: never try it again this session.
+                        _UNAVAILABLE_MODELS.add(model_name)
+                        _save_retired_models(_UNAVAILABLE_MODELS)
+                        if not use_gateway and not gemini_models_refreshed:
+                            gemini_models_refreshed = True
+                            try:
+                                live_flash_models = await asyncio.to_thread(
+                                    get_flash_models_for_key,
+                                    client,
+                                )
+                                # If Google reports a model live again, stop
+                                # treating it as retired.
+                                still_retired = {m for m in _UNAVAILABLE_MODELS
+                                                 if m not in set(live_flash_models or [])}
+                                if still_retired != _UNAVAILABLE_MODELS:
+                                    _UNAVAILABLE_MODELS.clear()
+                                    _UNAVAILABLE_MODELS.update(still_retired)
+                                    _save_retired_models(_UNAVAILABLE_MODELS)
+                                attempted_models = set(models_to_try[:idx + 1])
+                                remaining_models = models_to_try[idx + 1:]
+                                refreshed_candidates = []
+                                for candidate in live_flash_models + remaining_models:
+                                    if (
+                                        candidate
+                                        and candidate not in _UNAVAILABLE_MODELS
+                                        and candidate not in attempted_models
+                                        and candidate not in refreshed_candidates
+                                    ):
+                                        refreshed_candidates.append(candidate)
+                                models_to_try[idx + 1:] = refreshed_candidates[:MAX_MODELS_PER_ANALYSIS]
+                                next_model_hint = (
+                                    refreshed_candidates[0] if refreshed_candidates else None
+                                )
+                                if refreshed_candidates:
+                                    logger.warning(
+                                        "Gemini model %s is unavailable; refreshed live Flash "
+                                        "fallback candidates: %s",
+                                        model_name,
+                                        refreshed_candidates,
+                                    )
+                            except Exception as discovery_error:
+                                logger.warning(
+                                    "Could not refresh Gemini Flash models after %s: %s",
+                                    model_name,
+                                    discovery_error,
+                                )
                         break
                     
                     is_server_busy = any(x in err_str for x in ('503', 'unavailable', 'overloaded', '500', 'internal'))
@@ -1147,12 +1737,51 @@ async def analyze_video(request: AnalyzeRequest):
                     "message": f"{model_name} {err_summary} — switching to flash fallback model {next_model_hint}..."
                 })
 
+        if analysis_data is None and enriched_transcript:
+            # AI entirely unavailable (quota 429 / 503 spikes / retired models).
+            # Do not stall the studio: build clip candidates locally from the
+            # transcript and continue, clearly flagged as a local fallback.
+            ai_unavailable_note = str(encountered_quota_error or last_error or "AI tidak tersedia")
+            logger.warning(
+                "All AI models failed (%s); using local transcript fallback",
+                ai_unavailable_note[:160])
+            yield _sse({
+                "step": 4,
+                "step_progress": 96,
+                "overall_progress": 96,
+                "stage": "Local Fallback",
+                "detail": (
+                    "AI Gemini tidak tersedia saat ini — ACS membuat kandidat klip "
+                    "dari transkrip secara lokal. Kamu tetap bisa render & publish."),
+                "message": "AI tidak tersedia — memakai pemilihan klip lokal dari transkrip.",
+                "warning": True,
+            })
+            analysis_data = {"summary": "", "clips": []}
+            successful_model = "local-transcript-fallback"
+
         if analysis_data is None:
             # If any model in the fallback chain suffered quota exhaustion, prioritize showing the quota explanation
             error_to_report = encountered_quota_error or last_error
             if error_to_report is not None:
                 err_str = str(error_to_report).lower()
-                if any(x in err_str for x in ('429', 'quota', 'resource exhausted', 'rate limit')):
+                if use_gateway:
+                    logger.error(f"Gateway AI analysis failed for {requested_model}: {error_to_report}")
+                    if "finish_reason=length" in err_str:
+                        user_error = (
+                            f"Gateway AI ({requested_model}) mencapai batas token output sebelum menghasilkan "
+                            f"JSON lengkap. ACS sekarang mengirim batas output yang lebih besar; bila masih terjadi, "
+                            f"pilih lebih sedikit klip atau rentang video yang lebih pendek. Detail: {error_to_report}"
+                        )
+                    elif any(x in err_str for x in ("respons kosong", "empty response", "unparseable response")):
+                        user_error = (
+                            f"Gateway AI ({requested_model}) tidak mengembalikan teks/JSON yang bisa dibaca "
+                            f"setelah dicoba ulang. Coba rentang video lebih pendek atau model Gateway lain. "
+                            f"Detail: {error_to_report}"
+                        )
+                    else:
+                        user_error = f"Gateway AI ({requested_model}) gagal: {error_to_report}"
+                    yield _sse({"error": user_error, "status": 502})
+                elif any(x in err_str for x in ('429', 'quota', 'resource exhausted', 'rate limit')):
                     yield _sse({
                         "error": "Quota limit reached across all available Gemini Flash models for this API key. Free keys have a request limit per minute. Please change your API key, generate a fresh free key at aistudio.google.com, or wait 30–60 seconds before trying again.",
                         "status": 429
@@ -1180,10 +1809,16 @@ async def analyze_video(request: AnalyzeRequest):
                         "status": 500
                     })
             else:
-                yield _sse({
-                    "error": "No response received after trying all available Gemini Flash models. Please change your Gemini API key or try again in a few moments.",
-                    "status": 500
-                })
+                if use_gateway:
+                    yield _sse({
+                        "error": f"Gateway AI ({requested_model}) tidak mengembalikan respons. Coba lagi atau gunakan model Gateway lain.",
+                        "status": 502
+                    })
+                else:
+                    yield _sse({
+                        "error": "No response received after trying all available Gemini Flash models. Please change your Gemini API key or try again in a few moments.",
+                        "status": 500
+                    })
             return
 
         # Fallback clip synthesis if 0 clips were returned after all models
@@ -1268,16 +1903,53 @@ async def analyze_video(request: AnalyzeRequest):
             "model": successful_model or requested_model,
             "message": f"Found {clip_count} viral clip candidates ({lang_name}) with {successful_model or requested_model} — reconstructing transcripts..."
         })
-        logger.info(f"Gemini analysis complete with {successful_model or requested_model}. Found {clip_count} clips in {lang_name}.")
+        completion_provider = "Gateway AI" if use_gateway else "Gemini"
+        logger.info(f"{completion_provider} analysis complete with {successful_model or requested_model}. Found {clip_count} clips in {lang_name}.")
 
         # Reconstruct clip transcripts from enriched_transcript
         final_clips = []
         for raw_clip in analysis_data.get('clips', []):
-            start = raw_clip.get('start_time', 0.0)
-            end   = raw_clip.get('end_time', 0.0)
-            hook  = raw_clip.get('hook_time')
-            if hook is None or not (start <= hook <= end):
-                hook = start
+            if use_gateway:
+                start = _coerce_model_seconds(_first_model_value(
+                    raw_clip, "start_time", "startTime", "start_seconds", "start"
+                ))
+                end = _coerce_model_seconds(_first_model_value(
+                    raw_clip, "end_time", "endTime", "end_seconds", "end"
+                ))
+                hook = _coerce_model_seconds(_first_model_value(
+                    raw_clip, "hook_time", "hookTime", "hook_seconds", "hook"
+                ))
+                if start is None or end is None or end <= start:
+                    recovered = _recover_clip_times(
+                        raw_clip,
+                        enriched_transcript,
+                        request.duration,
+                        float(start_bound or 0.0),
+                        float(end_bound or duration),
+                    )
+                    if recovered:
+                        start, end = recovered
+                        logger.warning(
+                            "Recovered missing clip timestamps from key_quotes for %r: %.2f-%.2fs",
+                            _coerce_model_text(raw_clip.get("title", "")),
+                            start,
+                            end,
+                        )
+                    else:
+                        logger.warning(
+                            "Skipping clip without usable timestamps or transcript quote match: %r",
+                            _coerce_model_text(raw_clip.get("title", "")),
+                        )
+                        continue
+                if hook is None or not (start <= hook <= end):
+                    hook = start
+            else:
+                # Preserve the original native Gemini response handling.
+                start = raw_clip.get('start_time', 0.0)
+                end = raw_clip.get('end_time', 0.0)
+                hook = raw_clip.get('hook_time')
+                if hook is None or not (start <= hook <= end):
+                    hook = start
             
             # Enforce max 90 seconds (1m 30s) duration constraint for auto duration mode
             if is_auto_duration and (end - start) > 90.0:
@@ -1295,22 +1967,49 @@ async def analyze_video(request: AnalyzeRequest):
                 if max(line.get("start", 0.0), start) < min(line.get("end", 0.0), end)
             ]
             
-            # Ensure hashtags are always lowercase
-            caption_sug = lowercase_hashtags_in_string(raw_clip.get('caption_suggestion', ''))
-            hashtag_sug = lowercase_hashtags_in_string(raw_clip.get('hashtag_suggestion', ''))
+            # Only Gateway responses need shape coercion; keep native Gemini's
+            # schema-validated values on the original code path.
+            if use_gateway:
+                caption_sug = lowercase_hashtags_in_string(
+                    _coerce_model_text(raw_clip.get('caption_suggestion', ''))
+                )
+                hashtag_sug = lowercase_hashtags_in_string(
+                    _coerce_model_text(raw_clip.get('hashtag_suggestion', ''))
+                )
+                title_value = _coerce_model_text(raw_clip.get('title', ''))
+                title_suggestion_value = _coerce_model_text(raw_clip.get('title_suggestion', ''))
+                virality_score = _coerce_model_int(raw_clip.get('virality_score', 0))
+                key_quotes = _coerce_model_text_list(raw_clip.get('key_quotes'))
+            else:
+                caption_sug = lowercase_hashtags_in_string(raw_clip.get('caption_suggestion', ''))
+                hashtag_sug = lowercase_hashtags_in_string(raw_clip.get('hashtag_suggestion', ''))
+                title_value = raw_clip.get('title', '')
+                title_suggestion_value = raw_clip.get('title_suggestion', '')
+                virality_score = raw_clip.get('virality_score', 0)
+                key_quotes = raw_clip.get('key_quotes') or []
             
             final_clips.append(ViralClip(
-                title=sanitize_first_person_title(raw_clip.get('title', ''), channel, lang=lang_code),
+                title=sanitize_first_person_title(title_value, channel, lang=title_lang_code),
                 start_time=start,
                 end_time=end,
                 hook_time=hook,
-                virality_score=raw_clip.get('virality_score', 0),
-                key_quotes=raw_clip.get('key_quotes') or [],
+                virality_score=virality_score,
+                key_quotes=key_quotes,
                 transcript=" ".join(clip_lines),
-                title_suggestion=sanitize_first_person_title(raw_clip.get('title_suggestion', ''), channel, lang=lang_code),
+                title_suggestion=sanitize_first_person_title(title_suggestion_value, channel, lang=title_lang_code),
                 caption_suggestion=caption_sug,
                 hashtag_suggestion=hashtag_sug
             ))
+
+        if use_gateway and not final_clips:
+            yield _sse({
+                "error": (
+                    "Gateway AI returned clip suggestions but no usable timestamps, and ACS could not "
+                    "match their quotes to the timed transcript. Try another model or rerun analysis."
+                ),
+                "status": 422
+            })
+            return
 
         # Enforce max constraint of ~200 clips for auto clip count
         if is_auto_clip_count and len(final_clips) > 200:
@@ -1335,8 +2034,20 @@ async def analyze_video(request: AnalyzeRequest):
             for line in enriched_transcript
         ]
 
-        # Ensure hashtags are lowercase in the overall summary
-        clean_summary = lowercase_hashtags_in_string(analysis_data.get("summary", ""))
+        if use_gateway:
+            # Gateway models may omit or mistype the summary field.
+            summary_text = _coerce_model_text(analysis_data.get("summary", ""))
+            if not summary_text:
+                if lang_code == "id":
+                    summary_text = f"Analisis video \"{title}\" menemukan {len(final_clips)} kandidat klip. #viral #highlights"
+                elif lang_code == "es":
+                    summary_text = f"Análisis de \"{title}\" identificó {len(final_clips)} clips destacados. #viral #highlights"
+                else:
+                    summary_text = f"Analysis of \"{title}\" identified {len(final_clips)} highlight clips. #viral #highlights"
+            clean_summary = lowercase_hashtags_in_string(summary_text)
+        else:
+            # Preserve the original native Gemini summary path.
+            clean_summary = lowercase_hashtags_in_string(analysis_data.get("summary", ""))
 
         final_result = AnalyzeResponse(
             video_id=video_id,

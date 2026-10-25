@@ -208,44 +208,68 @@ DE_STOPWORDS = {
     'bei', 'einer', 'um', 'am', 'sind', 'noch', 'wie', 'einem', 'über'
 }
 
+# Distinctive colloquial Indonesian markers. These words are very rare in other
+# languages, so they are weighted 2x while scoring Indonesian evidence. Without
+# this weighting, short or jargon-heavy Indonesian transcripts fell below the
+# evidence threshold and were reported as English.
+ID_MARKERS = {
+    'nggak', 'gak', 'ga', 'gitu', 'gini', 'udah', 'banget', 'bang', 'aja', 'saja',
+    'kayak', 'kaya', 'emang', 'bener', 'bgt', 'gimana', 'kenapa', 'kalo', 'kalau',
+    'sih', 'deh', 'dong', 'kok', 'nih', 'tuh', 'gw', 'gue', 'lu', 'lo', 'kalian',
+    'bikin', 'ngomong', 'pengen', 'males', 'gampang', 'cuma', 'dapet', 'ngerti',
+}
+
+ID_WEIGHTS = {w: 1 for w in ID_STOPWORDS}
+ID_WEIGHTS.update({w: 2 for w in ID_MARKERS})
+
 def detect_transcript_language(transcript_lines: List[dict], title: str = "") -> dict:
     """
     Detects the primary spoken language of the video transcript using character script inspection
     and stopword analysis across Indonesian, English, Spanish, Portuguese, French, German, and others.
-    Returns dict: {'code': 'id', 'name': 'Indonesian (Bahasa Indonesia)', 'confidence': float}
+    Returns dict: {'code': 'id', 'name': 'Indonesian (Bahasa Indonesia)', 'confidence': float,
+                   'uncertain': bool}
+
+    `uncertain=True` means the transcript did not contain enough evidence for a confident call
+    (short clip, jargon-only speech, partially fetched transcript). Callers must NOT hard-force
+    English in that case - the AI is asked to decide from the dialogue itself. This function used
+    to silently default to English, which is what turned Indonesian videos into English hooks,
+    captions and subtitles. A code of 'auto' means "no usable evidence at all", so the caller
+    lets the AI detect the spoken language on its own.
     """
     if not transcript_lines and not title:
-        return {'code': 'en', 'name': 'English', 'confidence': 0.5}
+        return {'code': 'auto', 'name': 'Auto-detect', 'confidence': 0.0, 'uncertain': True}
 
     sample_texts = [title] if title else []
-    for line in (transcript_lines[:150] if transcript_lines else []):
+    # Wider window than the old 150-line cap: long videos frequently open with an
+    # English intro/promo while the actual dialogue is in another language.
+    for line in (transcript_lines[:400] if transcript_lines else []):
         t = line.get("text", "")
         if t:
             sample_texts.append(t)
     
     full_sample = " ".join(sample_texts).strip()
     if not full_sample:
-        return {'code': 'en', 'name': 'English', 'confidence': 0.5}
+        return {'code': 'auto', 'name': 'Auto-detect', 'confidence': 0.0, 'uncertain': True}
 
     # 1. Non-Latin script checks
     if re.search(r'[\u3040-\u309F\u30A0-\u30FF]', full_sample):
-        return {'code': 'ja', 'name': LANGUAGE_NAMES['ja'], 'confidence': 0.98}
+        return {'code': 'ja', 'name': LANGUAGE_NAMES['ja'], 'confidence': 0.98, 'uncertain': False}
     if re.search(r'[\uAC00-\uD7AF\u1100-\u11FF]', full_sample):
-        return {'code': 'ko', 'name': LANGUAGE_NAMES['ko'], 'confidence': 0.98}
+        return {'code': 'ko', 'name': LANGUAGE_NAMES['ko'], 'confidence': 0.98, 'uncertain': False}
     if re.search(r'[\u4E00-\u9FFF]', full_sample):
-        return {'code': 'zh', 'name': LANGUAGE_NAMES['zh'], 'confidence': 0.95}
+        return {'code': 'zh', 'name': LANGUAGE_NAMES['zh'], 'confidence': 0.95, 'uncertain': False}
     if re.search(r'[\u0600-\u06FF]', full_sample):
-        return {'code': 'ar', 'name': LANGUAGE_NAMES['ar'], 'confidence': 0.98}
+        return {'code': 'ar', 'name': LANGUAGE_NAMES['ar'], 'confidence': 0.98, 'uncertain': False}
     if re.search(r'[\u0400-\u04FF]', full_sample):
-        return {'code': 'ru', 'name': LANGUAGE_NAMES['ru'], 'confidence': 0.98}
+        return {'code': 'ru', 'name': LANGUAGE_NAMES['ru'], 'confidence': 0.98, 'uncertain': False}
 
     # 2. Latin word tokenization
     tokens = re.findall(r'\b[a-zA-Z\u00C0-\u024F\u1E00-\u1EFF]+\b', full_sample.lower())
     if not tokens:
-        return {'code': 'en', 'name': 'English', 'confidence': 0.5}
+        return {'code': 'auto', 'name': 'Auto-detect', 'confidence': 0.0, 'uncertain': True}
 
     counts = {
-        'id': sum(1 for w in tokens if w in ID_STOPWORDS),
+        'id': sum(ID_WEIGHTS.get(w, 0) for w in tokens),
         'en': sum(1 for w in tokens if w in EN_STOPWORDS),
         'es': sum(1 for w in tokens if w in ES_STOPWORDS),
         'pt': sum(1 for w in tokens if w in PT_STOPWORDS),
@@ -255,22 +279,70 @@ def detect_transcript_language(transcript_lines: List[dict], title: str = "") ->
 
     best_lang, best_score = max(counts.items(), key=lambda item: item[1])
     total_matches = sum(counts.values())
-    confidence = round(best_score / total_matches, 2) if total_matches > 0 else 0.5
+    confidence = round(best_score / total_matches, 2) if total_matches > 0 else 0.0
 
-    # If match count is very small, cross-check with title words
+    # Weak evidence: cross-check with title words, then report an honest "uncertain"
+    # verdict instead of silently claiming English.
     if best_score < 2:
         title_tokens = set(re.findall(r'\b[a-zA-Z]+\b', title.lower()))
-        if title_tokens.intersection(ID_STOPWORDS):
-            return {'code': 'id', 'name': LANGUAGE_NAMES['id'], 'confidence': 0.75}
+        if title_tokens.intersection(ID_STOPWORDS) or title_tokens.intersection(ID_MARKERS):
+            return {'code': 'id', 'name': LANGUAGE_NAMES['id'], 'confidence': 0.7, 'uncertain': False}
         if title_tokens.intersection(ES_STOPWORDS):
-            return {'code': 'es', 'name': LANGUAGE_NAMES['es'], 'confidence': 0.75}
-        return {'code': 'en', 'name': 'English', 'confidence': 0.5}
+            return {'code': 'es', 'name': LANGUAGE_NAMES['es'], 'confidence': 0.7, 'uncertain': False}
+        if total_matches == 0:
+            return {'code': 'auto', 'name': 'Auto-detect', 'confidence': 0.0, 'uncertain': True}
+        return {
+            'code': best_lang,
+            'name': LANGUAGE_NAMES.get(best_lang, best_lang.upper()),
+            'confidence': confidence,
+            'uncertain': True,
+        }
 
     return {
         'code': best_lang,
         'name': LANGUAGE_NAMES.get(best_lang, best_lang.upper()),
-        'confidence': confidence
+        'confidence': confidence,
+        'uncertain': False,
     }
+
+
+# Human friendly aliases accepted from the UI / API when the user forces an output language.
+LANGUAGE_ALIASES = {
+    'indonesian': 'id', 'bahasa': 'id', 'bahasa indonesia': 'id', 'ind': 'id',
+    'english': 'en', 'eng': 'en', 'american english': 'en',
+    'spanish': 'es', 'espanol': 'es', 'espa\u00f1ol': 'es', 'spa': 'es',
+    'portuguese': 'pt', 'portugues': 'pt', 'portugu\u00eas': 'pt', 'por': 'pt',
+    'french': 'fr', 'francais': 'fr', 'fran\u00e7ais': 'fr', 'fra': 'fr', 'fre': 'fr',
+    'german': 'de', 'deutsch': 'de', 'deu': 'de', 'ger': 'de',
+    'japanese': 'ja', 'jpn': 'ja',
+    'korean': 'ko', 'kor': 'ko',
+    'chinese': 'zh', 'mandarin': 'zh', 'zho': 'zh', 'chi': 'zh',
+    'arabic': 'ar', 'ara': 'ar',
+    'russian': 'ru', 'rus': 'ru',
+}
+
+
+def resolve_language_override(value: Optional[str]) -> Optional[dict]:
+    """
+    Normalizes a user supplied output-language override into {'code', 'name'}.
+
+    Accepts 'auto' (no override), ISO codes ('id', 'en', 'pt-BR', 'zh-Hans') and
+    human readable names ('Indonesian', 'Bahasa Indonesia'). Returns None when the
+    output language should be auto-detected from the video itself.
+    """
+    if value is None:
+        return None
+    raw = str(value).strip().lower().replace('_', '-')
+    if raw in ('', 'auto', 'automatic', 'detect', 'autodetect', 'none', 'default'):
+        return None
+    code = raw.split('-')[0]
+    candidate = raw if raw in LANGUAGE_NAMES else code
+    if candidate not in LANGUAGE_NAMES:
+        candidate = LANGUAGE_ALIASES.get(raw) or LANGUAGE_ALIASES.get(code) or ''
+    if candidate not in LANGUAGE_NAMES:
+        return None
+    return {'code': candidate, 'name': LANGUAGE_NAMES[candidate]}
+
 
 def sanitize_first_person_title(title: str, speaker_or_channel: str = "", lang: str = "en") -> str:
     """

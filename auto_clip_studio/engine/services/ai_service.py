@@ -40,8 +40,8 @@ def parse_gemini_model_sort_key(name: str):
 
 def get_flash_models_for_key(client: genai.Client) -> List[str]:
     """Dynamically query all available flash models for the given API key.
-    Discovers newer versions (e.g., 3.7, 3.6, 3.5) and earlier versions (2.5, 2.0, 1.5),
-    merging with known fallback models and sorting in descending order of version/capability."""
+    Uses the live list when available; the bundled list is only a fallback for
+    cases where model discovery fails or the account exposes no Flash models."""
     discovered = []
     try:
         models_page = client.models.list()
@@ -62,10 +62,11 @@ def get_flash_models_for_key(client: genai.Client) -> List[str]:
     except Exception as e:
         logger.warning(f"Could not dynamically list models: {e}")
 
-    # Combine discovered with known flash models, preserving uniqueness
-    combined_pool = list(dict.fromkeys(discovered + KNOWN_FLASH_MODELS))
-    # Sort descending so newest versions (3.7, 3.6, 3.5, 2.5, 2.0, 1.5) are prioritized
-    ordered = sorted(combined_pool, key=parse_gemini_model_sort_key, reverse=True)
+    # Do not append retired IDs to a successful live response: that can make
+    # ACS retry models the user's key can no longer access. Keep known models
+    # only as a last-resort list when discovery produced no usable Flash model.
+    model_pool = discovered or KNOWN_FLASH_MODELS
+    ordered = sorted(list(dict.fromkeys(model_pool)), key=parse_gemini_model_sort_key, reverse=True)
     return ordered
 
 
@@ -115,8 +116,12 @@ def list_available_gemini_models(api_key: str = "") -> List[str]:
                         other_models.append(short_name)
         
         # Sort flash models by version descending (e.g. 3.7, 3.6, 3.5, 2.5, 2.0, 1.5)
+        # The live Google list is authoritative for a real API key. Adding
+        # bundled historical IDs here made the UI treat retired models as
+        # currently available and preserve them as the selected model.
+        live_flash_models = list(dict.fromkeys(flash_models))
         ordered_flash = sorted(
-            list(dict.fromkeys(flash_models + KNOWN_FLASH_MODELS)),
+            live_flash_models or KNOWN_FLASH_MODELS,
             key=parse_gemini_model_sort_key,
             reverse=True
         )

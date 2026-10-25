@@ -44,6 +44,9 @@ class RenderSettingsModel(BaseModel):
     watermark_opacity: Optional[float] = 80.0
     watermark_x: Optional[float] = 90.0
     watermark_y: Optional[float] = 8.0
+    # New split-screen compositions: "none" (default), "two_person" (permanent
+    # top/bottom pair) or "reaction_split" (temporary side-by-side moments).
+    split_screen: Optional[str] = "none"
     hardware_accel: Optional[str] = "auto"
     output_dir: Optional[str] = None
 
@@ -53,6 +56,10 @@ class RenderBatchRequest(BaseModel):
     clips: List[Dict[str, Any]]
     settings: RenderSettingsModel
     transcript: Optional[List[Dict[str, Any]]] = None
+    # Output language chosen during analysis ('auto' | ISO code such as 'id'/'en').
+    # Propagated into the ClipContext handed to automation so AI captions/hooks keep
+    # the analysed video's language instead of defaulting to Indonesian.
+    language: Optional[str] = "auto"
 
 class RetryBatchRequest(BaseModel):
     clip_indices: Optional[List[int]] = None

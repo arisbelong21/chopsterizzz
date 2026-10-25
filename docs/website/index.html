@@ -1,0 +1,69 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Chopster — Desktop Content Publishing Tool</title>
+<meta name="description" content="Chopster is an offline desktop tool that helps creators prepare and publish their own video content to their own social media accounts.">
+<style>
+  :root { --bg:#0e1116; --card:#171b22; --fg:#e8eaed; --muted:#9aa4b2; --accent:#25d366; --line:#242a33; }
+  * { box-sizing:border-box; }
+  body { margin:0; background:var(--bg); color:var(--fg); font:16px/1.65 -apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif; }
+  .wrap { max-width:820px; margin:0 auto; padding:48px 22px 72px; }
+  header { display:flex; align-items:center; gap:14px; margin-bottom:8px; }
+  .logo { width:46px; height:46px; border-radius:12px; background:linear-gradient(135deg,#25d366,#0f9d58); display:flex; align-items:center; justify-content:center; font-weight:700; font-size:22px; color:#06210f; }
+  h1 { font-size:30px; margin:0; letter-spacing:-.3px; }
+  .tag { color:var(--muted); margin:2px 0 34px; }
+  h2 { font-size:19px; margin:34px 0 10px; }
+  .card { background:var(--card); border:1px solid var(--line); border-radius:14px; padding:20px 22px; margin:18px 0; }
+  ul { margin:8px 0 0; padding-left:20px; }
+  li { margin:6px 0; }
+  a { color:var(--accent); }
+  footer { margin-top:44px; padding-top:20px; border-top:1px solid var(--line); color:var(--muted); font-size:14px; }
+  code { background:#0b0e13; border:1px solid var(--line); border-radius:6px; padding:1px 6px; font-size:14px; }
+</style>
+</head>
+<body>
+<div class="wrap">
+
+  <header>
+    <div class="logo">C</div>
+    <h1>Chopster</h1>
+  </header>
+  <p class="tag">Desktop content publishing tool for creators — runs locally on your own computer.</p>
+
+  <div class="card">
+    <strong>What it is</strong>
+    <p>Chopster is a desktop application that helps a creator prepare their own video content — clipping, captioning and formatting — and publish that content to the creator's own social media accounts, including TikTok.</p>
+    <p>Chopster runs entirely on the user's own computer. It is not a web service, it does not operate a server, and it does not store user data in the cloud.</p>
+  </div>
+
+  <h2>How it works</h2>
+  <ul>
+    <li>The user installs and runs Chopster locally on their own device.</li>
+    <li>The user signs in to TikTok and authorises Chopster to publish content to <em>their own</em> account.</li>
+    <li>The user selects a video file from their own device and confirms the caption.</li>
+    <li>Chopster sends that video to TikTok using the official TikTok Content Posting API, either as a draft in the creator's TikTok inbox for manual review, or as a direct post, depending on the authorisation the creator grants.</li>
+  </ul>
+
+  <h2>Data</h2>
+  <ul>
+    <li>Chopster stores the TikTok access token locally on the user's device only.</li>
+    <li>No content, token or personal data is transmitted to any server operated by Chopster, because Chopster operates no server.</li>
+    <li>Tokens are deleted immediately when the user disconnects their account.</li>
+  </ul>
+
+  <h2>Legal</h2>
+  <ul>
+    <li><a href="terms.html">Terms of Service</a></li>
+    <li><a href="privacy.html">Privacy Policy</a></li>
+  </ul>
+
+  <footer>
+    <p>Contact: <a href="mailto:GANTI_EMAIL@example.com">GANTI_EMAIL@example.com</a></p>
+    <p>Chopster is an independent tool and is not affiliated with, endorsed by, or sponsored by TikTok.</p>
+  </footer>
+
+</div>
+</body>
+</html>

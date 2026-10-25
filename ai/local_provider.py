@@ -124,6 +124,170 @@ def analyze_frames(image_paths: list[str], prompt: str = "") -> dict[str, Any]:
     }
 
 
+#: Content-pack house style for the offline provider: CAPSLOCK titles, a hook +
+#: CTA in every description, and hashtags taken from the transcript itself
+#: instead of a generic list (the "kelihatan bot" Studio complaint).
+_PACK_TITLE_SHAPES = {
+    "id": (
+        "{topic}: YANG BIKIN BERHENTI SCROLL",
+        "KENAPA {topic} JADI BAHAN PERHATIAN?",
+        "{topic} - BAGIAN YANG JARANG DIBAHAS",
+        "INI YANG TERJADI SAAT {topic} DIBAHAS",
+    ),
+    "en": (
+        "{topic}: THE PART THAT STOPS THE SCROLL",
+        "WHY {topic} GOT EVERYONE'S ATTENTION",
+        "{topic} - THE PART NOBODY TALKS ABOUT",
+        "WHAT HAPPENS WHEN {topic} GETS DISCUSSED",
+    ),
+}
+_PACK_CTAS = {
+    "id": (
+        "Tulis pendapatmu di komentar.",
+        "Follow untuk bagian berikutnya.",
+        "Bagikan kalau kamu setuju.",
+    ),
+    "en": (
+        "Drop your take in the comments.",
+        "Follow for the next part.",
+        "Share it if you agree.",
+    ),
+}
+_PACK_STOPWORDS = frozenset({
+    "yang", "dengan", "untuk", "dari", "pada", "dalam", "akan", "tidak", "bukan",
+    "juga", "karena", "tapi", "tetapi", "atau", "ini", "itu", "saja", "bisa",
+    "harus", "sudah", "masih", "lebih", "sangat", "kita", "kami", "mereka", "kamu",
+    "adalah", "saat", "ketika", "kalau", "jika", "agar", "supaya", "oleh",
+    "tentang", "banyak", "begitu", "secara", "tersebut", "video", "bagian",
+    "shot", "shorts", "clip", "podcast", "highlight", "conversation",
+    "the", "and", "for", "with", "that", "this", "from", "you", "your", "are",
+    "was", "were", "have", "has", "had", "will", "would", "could", "should",
+    "about", "into", "just", "like", "when", "what", "who", "how", "why",
+})
+_PACK_TRANSCRIPT_RE = re.compile(r"Transkrip/konteks:\s*(.*)", re.S | re.IGNORECASE)
+#: The prompt's own JSON-format block follows the transcript and must never be
+#: mined for keywords ("#json", "#description_long" is the bot smell).
+_PACK_TAIL_RE = re.compile(r"\n\s*Format JSON:.*", re.S | re.IGNORECASE)
+#: The caption prompt declares the output language on a "Bahasa: xx" line.
+_PACK_LANG_RE = re.compile(r"Bahasa:\s*([A-Za-z-]+)", re.IGNORECASE)
+_PACK_EN_MARKERS = frozenset({
+    "the", "and", "you", "your", "this", "that", "with", "what", "when", "why",
+    "how", "who", "are", "were", "have", "has", "had", "will", "would", "could",
+    "should", "about", "because", "people", "think", "really", "just", "like",
+})
+
+
+def _pack_capitalise(text: str) -> str:
+    clean = re.sub(r"\s+", " ", str(text or "")).strip()
+    return clean[:1].upper() + clean[1:] if clean else clean
+
+
+def _pack_caps(text: str, limit: int = 90) -> str:
+    """CAPSLOCK pack text, long enough to read but free of trailing punctuation."""
+    clean = re.sub(r"\s+", " ", str(text or "")).strip().upper()
+    if len(clean) > limit:
+        cut = clean[:limit]
+        clean = cut[:cut.rfind(" ")].strip() if " " in cut else cut
+    return clean
+
+
+def _pack_sentence(text: str, limit: int) -> str:
+    clean = re.sub(r"\s+", " ", str(text or "")).strip()
+    if not clean:
+        return ""
+    parts = re.split(r"(?<=[.!?])\s+", clean)
+    return (parts[0] if parts else clean).strip()[:limit]
+
+
+def _detect_pack_language(prompt: str, body: str) -> str:
+    """Resolve the pack's output language ('id' or 'en').
+
+    Order of evidence: the prompt's explicit "Bahasa: xx" line wins; otherwise a light
+    stopword scan of the transcript body picks the dominant language, defaulting to 'id'
+    (Chopster's house default) only when the evidence is genuinely mixed or empty.
+    """
+    m = _PACK_LANG_RE.search(prompt or "")
+    if m:
+        code = (m.group(1) or "").strip().lower().split("-")[0]
+        if code in ("en", "id"):
+            return code
+    tokens = re.findall(r"\b[a-z]+\b", (body or "").lower())
+    if not tokens:
+        return "id"
+    id_hits = sum(1 for t in tokens if t in _PACK_STOPWORDS and t not in _PACK_EN_MARKERS)
+    en_hits = sum(1 for t in tokens if t in _PACK_EN_MARKERS)
+    if en_hits > id_hits:
+        return "en"
+    return "id"
+
+
+def _pack_json(prompt: str) -> dict[str, Any]:
+    """Deterministic content pack built from the transcript inside the prompt.
+
+    The pack's titles, CTAs and descriptions follow the transcript's own language
+    (Indonesian or English) so an English video never receives an Indonesian pack.
+    """
+    match = _PACK_TRANSCRIPT_RE.search(prompt or "")
+    body = (match.group(1) if match else (prompt or "").split("\n\n")[-1])
+    body = _PACK_TAIL_RE.sub("", str(body or ""))
+    body = re.sub(r"\s+", " ", str(body or "")).strip()
+    lang = _detect_pack_language(prompt, body)
+    words = [w for w in re.findall(r"\b[^\W\d_]{4,}\b", body.lower()) if w not in _PACK_STOPWORDS]
+    freq: dict[str, int] = {}
+    for word in words:
+        freq[word] = freq.get(word, 0) + 1
+    top = sorted(freq, key=lambda key: (-freq[key], key))[:8]
+    default_topic = "video ini" if lang == "id" else "this video"
+    topic = _pack_caps(" ".join(top[:3]) or body[:60] or default_topic, 48)
+    hook_fallback = (
+        f"Bagian ini membahas {topic.lower()}." if lang == "id"
+        else f"This part covers {topic.lower()}."
+    )
+    hook = _pack_capitalise(_pack_sentence(body, 150)) or hook_fallback
+    cta = _PACK_CTAS[lang][len(words) % len(_PACK_CTAS[lang])]
+    details = ", ".join(top[:6]) or topic.lower()
+    title_shapes = _PACK_TITLE_SHAPES[lang]
+    if lang == "id":
+        captions = [
+            f"{hook} Bagian mana yang paling kamu setujui? {cta}",
+            f"Ada satu poin soal {topic.lower()} yang gampang kelewat. {cta}",
+            f"{hook} Tonton sampai habis, lalu bilang mana yang paling masuk akal.",
+        ]
+        description_long = (
+            f"{hook}\n\nPembahasan bergerak di sekitar {details}. "
+            "Konteks sebelum dan sesudah potongan ini membantu memahami poinnya secara utuh.\n\n"
+            f"Kata kunci yang menandai bagian ini: {details}.\n\n{cta}"
+        )
+        pinned = f"Bagian {topic.lower()} mana yang menurutmu paling penting? Jelaskan alasannya."
+        thumbs = ["BAGIAN INI", "MENURUT KAMU?", "BAGIAN INI PENTING", "DENGAR SAMPAI AKHIR"]
+        hashtags_default = "#shortvideo"
+    else:
+        captions = [
+            f"{hook} Which part do you agree with the most? {cta}",
+            f"There's one point about {topic.lower()} that's easy to miss. {cta}",
+            f"{hook} Watch it to the end, then tell us which part makes the most sense.",
+        ]
+        description_long = (
+            f"{hook}\n\nThe discussion centres on {details}. "
+            "The context before and after this cut helps the point land in full.\n\n"
+            f"Keywords that mark this part: {details}.\n\n{cta}"
+        )
+        pinned = f"Which part of {topic.lower()} matters most to you? Explain why."
+        thumbs = ["THIS PART", "WHAT DO YOU THINK?", "THIS PART MATTERS", "LISTEN TO THE END"]
+        hashtags_default = "#shorts"
+    return {
+        "titles": [_pack_caps(title_shapes[i % len(title_shapes)].format(topic=topic), 100)
+                   for i in range(3)],
+        "captions": captions,
+        "description_short": f"{hook} Fokusnya {details}. {cta}" if lang == "id" else f"{hook} It focuses on {details}. {cta}",
+        "description_long": description_long,
+        "hashtags": [f"#{w}" for w in top[:10]] or [hashtags_default],
+        "keywords": top,
+        "pinned_comment": pinned,
+        "thumbnail_text": [_pack_caps(topic, 24) or ("BAGIAN INI" if lang == "id" else "THIS PART"), *thumbs[1:]],
+    }
+
+
 class LocalProvider(AIProvider):
     @property
     def name(self) -> str:
@@ -149,15 +313,10 @@ class LocalProvider(AIProvider):
         if "json" in low and ("candidates" in low or "highlights" in low):
             return AIResponse(text=json.dumps({"candidates": []}, ensure_ascii=False), raw={"provider":"local-ai","model":"embedded-heuristic"})
         if "caption" in low or "hashtag" in low or "title" in low or "description" in low:
-            return AIResponse(text=json.dumps({
-                "titles":["Momen yang Bikin Percakapan Ini Berubah", "Bagian Podcast yang Paling Menarik", "Kenapa Pernyataan Ini Jadi Perdebatan"],
-                "captions":["Potongan percakapan dengan konteks tetap utuh. Pilih angle yang paling cocok untuk audiensmu."],
-                "description_short":"Highlight percakapan dengan konteks yang tetap dijaga.",
-                "description_long":"Ini adalah potongan percakapan yang menampilkan bagian penting dari pembahasan. Gunakan konteks asli video sebagai acuan dan hindari mengambil kesimpulan di luar isi sumber.",
-                "hashtags":["#shorts","#podcast","#clip"],"keywords":["podcast","highlight","conversation"],
-                "pinned_comment":"Bagian mana yang paling menarik menurut kamu?",
-                "thumbnail_text":["WAJIB LIHAT BAGIAN INI", "TERNYATA BEGINI"]
-            }, ensure_ascii=False), raw={"provider":"local-ai","model":"embedded-heuristic"})
+            # Built from the transcript inside the prompt: generic canned titles
+            # and hashtags are what made the pack "kelihatan bot".
+            return AIResponse(text=json.dumps(_pack_json(text), ensure_ascii=False),
+                              raw={"provider":"local-ai","model":"embedded-heuristic"})
         if "voice-over" in low or "voiceover" in low:
             source=text.split("\n\n",1)[-1].strip()
             return AIResponse(text=source[:3000], raw={"provider":"local-ai","model":"embedded-heuristic"})

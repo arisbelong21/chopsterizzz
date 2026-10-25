@@ -9,12 +9,16 @@ import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable
+from typing import Any, Callable
 
 from chopster.downloader.ffmpeg import find_ffmpeg
 from chopster.clipper.media_probe import probe
 from chopster.clipper.camera_director import make_clip_relative
 from chopster.clipper.adaptive_framing import decide_framing
+from chopster.clipper.split_screen import (
+    build_reaction_overlay,
+    build_vstack_composition,
+)
 
 ProgressCb = Callable[[int, int, str], None]
 ClipCb = Callable[[int, str, str], None]
@@ -303,6 +307,44 @@ def _run_ffmpeg(cmd: list[str], cancel_check: Callable[[], bool] | None = None, 
             time.sleep(0.2)
 
 
+def _with_reaction_overlay(
+    filters: list,
+    windows: list[dict] | None,
+    *,
+    source_w: int,
+    source_h: int,
+    out_w: int,
+    out_h: int,
+) -> list:
+    """Wrap normal framing filters with the temporary horizontal split overlay.
+
+    The base framing produced by the existing pipeline stays the visible layout;
+    the reaction compose only appears inside the detected windows. When there is
+    nothing to overlay the original filter list is returned untouched, so the
+    legacy render path is byte-for-byte unchanged.
+    """
+    if not windows:
+        return filters
+    tuple_filter = next((x for x in filters if isinstance(x, tuple)), None)
+    extras = [x for x in filters if not isinstance(x, tuple)]
+    if tuple_filter:
+        base_graph, base_label = tuple_filter[0], (tuple_filter[1] or "[vfit]")
+    else:
+        chain = ",".join(extras) if extras else "null"
+        base_graph, base_label = f"[0:v]{chain}[base]", "[base]"
+        extras = []
+    overlay_graph, overlay_label = build_reaction_overlay(
+        windows, source_w=source_w, source_h=source_h, out_w=out_w, out_h=out_h, base_label=base_label,
+    )
+    if not overlay_graph:
+        return filters
+    return [(_join_graph(base_graph, overlay_graph), overlay_label)] + extras
+
+
+def _join_graph(*parts: str) -> str:
+    return ";".join(p for p in parts if p)
+
+
 def export_clip(
     source: str | Path,
     start: float,
@@ -321,6 +363,9 @@ def export_clip(
     watermark_font_size: int = 28,
     focus_points: list[dict] | None = None,
     audio_filter: str | None = None,
+    composition: str = "auto",
+    panel_plan: list[dict] | None = None,
+    reaction_windows: list[dict] | None = None,
 ) -> ExportResult:
     source = Path(source)
     output = Path(output)
@@ -365,6 +410,8 @@ def export_clip(
             and not watermark_image
             and aspect == "original"
             and start <= 0.001
+            and composition == "auto"
+            and not reaction_windows
         )
         if use_copy:
             cmd = [ff, "-hide_banner", "-loglevel", "error", "-y", "-ss", f"{start:.3f}", "-t", f"{duration:.3f}", "-i", str(source),
@@ -376,10 +423,23 @@ def export_clip(
                 return ExportResult(0, False, str(output), f"Aspect tidak dikenal: {aspect}")
 
             filters: list[str] = []
-            if aspect != "original":
-                w, h = aspect_res[aspect]
+            # The two-person split screen is a *new* composition. Legacy framing
+            # (plain subject crop and adaptive fit) only runs when the option is
+            # not active, so every previously available behaviour is preserved.
+            split_requested = composition == "split_v" and len([p for p in (panel_plan or []) if p]) >= 2
+            if aspect != "original" or split_requested:
+                w, h = aspect_res[aspect if aspect != "original" else "9:16"]
 
-                if focus_points:
+                if split_requested:
+                    graph, label = build_vstack_composition(
+                        panel_plan or [],
+                        source_w=int(meta.width or 1920),
+                        source_h=int(meta.height or 1080),
+                        out_w=w,
+                        out_h=h,
+                    )
+                    filters.append((graph, label))
+                elif focus_points:
                     pts = make_clip_relative(focus_points, start, end)
                     target_ratio = float(w) / float(h)
                     source_ratio = float(meta.width or 16) / max(1.0, float(meta.height or 9))
@@ -495,6 +555,16 @@ def export_clip(
                         filters.append(crop_chain)
                 else:
                     filters.append(f"scale=w={w}:h={h}:force_original_aspect_ratio=increase,crop={w}:{h}")
+            # Multi-person smart focus: the normal framing above stays the base
+            # layout, and the side-by-side composition is only enabled inside the
+            # detected reaction windows.
+            if reaction_windows and aspect != "original":
+                w, h = aspect_res[aspect]
+                filters = _with_reaction_overlay(
+                    filters, reaction_windows,
+                    source_w=int(meta.width or 1920), source_h=int(meta.height or 1080),
+                    out_w=w, out_h=h,
+                )
             if burn_subtitle:
                 temp_sub = _prepare_subtitle_for_clip(burn_subtitle, start, end)
                 subtitle_filter=f"subtitles='{_escape_filter_path(temp_sub)}'"
@@ -523,9 +593,10 @@ def export_clip(
                 wm_chain = f"[1:v]format=rgba,{wm_scale},colorchannelmixer=aa={opacity:.3f}[wm]"
                 tuple_filter = next((x for x in filters if isinstance(x, tuple)), None)
                 if tuple_filter:
-                    graph,_ = tuple_filter
+                    graph, graph_label = tuple_filter
+                    graph_label = graph_label or "[vfit]"
                     extras=[x for x in filters if not isinstance(x, tuple)]
-                    graph += (";[vfit]" + ",".join(extras) + "[base]") if extras else ";[vfit]null[base]"
+                    graph += (f";{graph_label}" + ",".join(extras) + "[base]") if extras else f";{graph_label}null[base]"
                     graph += ";" + wm_chain + f";[base][wm]overlay=x={pos_x}:y={pos_y}:eof_action=repeat:shortest=1[vout]"
                     filter_complex=graph
                 else:
@@ -548,15 +619,16 @@ def export_clip(
                     filters.append(draw)
                 tuple_filter = next((x for x in filters if isinstance(x, tuple)), None)
                 if tuple_filter:
-                    graph, crop_chain = tuple_filter
+                    graph, composition_label = tuple_filter
+                    composition_label = composition_label or "[vfit]"
                     # Keep the smart-fit graph simple and deterministic. If additional
                     # filters exist, apply them to the final portrait output.
                     extras=[x for x in filters if not isinstance(x, tuple)]
                     if extras:
-                        graph += ";[vfit]" + ",".join(extras) + "[vout]"
+                        graph += f";{composition_label}" + ",".join(extras) + "[vout]"
                         map_label="[vout]"
                     else:
-                        graph += ";[vfit]null[vout]"
+                        graph += f";{composition_label}null[vout]"
                         map_label="[vout]"
                     cmd = [ff, "-hide_banner", "-loglevel", "error", "-y", "-ss", f"{start:.3f}", "-t", f"{duration:.3f}", "-i", str(source),
                            "-filter_complex", graph, "-map", map_label, "-map", "0:a:0?"]
@@ -607,6 +679,47 @@ def export_clip(
         _cleanup_path(temp_output, attempts=3, delay=0.05)
 
 
+def _notify_automation(index: int, title: str, output: str,
+                       clip_start: float = 0.0, clip_end: float = 0.0,
+                       transcript: Any = None) -> None:
+    """Report a finished CCA clip to the Automation engine (spec 3.2).
+
+    Fire-and-forget by design: an automation problem must never turn a
+    successful export into a failed one. Content Clipper AI feeds the *same*
+    engine, queue and History as Auto Clip Studio — the only difference is the
+    ``source`` identity of the content.
+    """
+    try:
+        from chopster.automation.events import emit_clip_completed
+        body = {
+            "clip_index": int(index),
+            "clip_id": f"cca:{int(index)}",
+            "output_path": str(output),
+            "title": str(title or ""),
+            "source": "cca",
+        }
+        # Bind the analysed source transcript (windowed to this clip) so the AI
+        # Content Pack can never borrow another clip's context (spec 4.4).
+        if transcript:
+            try:
+                from chopster.automation.context import build_clip_context
+                ctx = build_clip_context(
+                    source="cca",
+                    source_asset_id=f"cca:{int(index)}",
+                    media_path=str(output),
+                    title=str(title or ""),
+                    clip_start=float(clip_start or 0.0),
+                    clip_end=float(clip_end or 0.0),
+                    segments=transcript,
+                    evidence="transcript Content Clipper AI untuk clip ini",
+                )
+                body["clip_context"] = ctx.to_dict()
+            except Exception:
+                pass
+        emit_clip_completed(body)
+    except Exception:
+        pass
+
 def export_batch(
     source: str | Path,
     clips: list[dict],
@@ -626,6 +739,10 @@ def export_batch(
     watermark_font_size: int = 28,
     focus_points: list[dict] | None = None,
     audio_filter: str | None = None,
+    transcript: Any = None,
+    composition: str = "auto",
+    panel_plan: list[dict] | None = None,
+    reaction_windows: list[dict] | None = None,
 ) -> tuple[int, int]:
     """Export immutable clip snapshots. UI code must not be accessed from here."""
     source = Path(source)
@@ -644,6 +761,12 @@ def export_batch(
             return idx, title, ExportResult(idx, False, str(out_path), "Dibatalkan")
         if on_clip:
             on_clip(idx, title, "Merender")
+        # One clip may carry its own composition plan (split panels / reaction
+        # windows are planned per clip). The batch arguments remain the default,
+        # so callers that do not set the key keep the previous behaviour.
+        clip_composition = str(c.get("composition") or composition)
+        clip_panels = c["panel_plan"] if isinstance(c.get("panel_plan"), list) else panel_plan
+        clip_windows = c["reaction_windows"] if isinstance(c.get("reaction_windows"), list) else reaction_windows
         res = export_clip(
             source, float(c["start"]), float(c["end"]), out_path,
             quality=quality, aspect=aspect, burn_subtitle=burn_subtitle,
@@ -651,7 +774,8 @@ def export_batch(
             watermark_text=watermark_text, watermark_image=watermark_image,
             watermark_position=watermark_position, watermark_opacity=watermark_opacity, watermark_scale=watermark_scale,
             watermark_font_size=watermark_font_size, focus_points=focus_points, audio_filter=audio_filter,
-            copy_if_possible=not any((burn_subtitle, watermark_text, watermark_image, focus_points, audio_filter)) and aspect == "original",
+            composition=clip_composition, panel_plan=clip_panels, reaction_windows=clip_windows,
+            copy_if_possible=not any((burn_subtitle, watermark_text, watermark_image, focus_points, audio_filter, clip_windows)) and aspect == "original" and clip_composition == "auto",
         )
         return idx, title, res
 
@@ -662,6 +786,11 @@ def export_batch(
             idx, title, res = result
             ok += int(res.success)
             fail += int(not res.success)
+            if res.success:
+                _notify_automation(idx, title, res.output,
+                                   clip_start=float(c.get("start", 0.0)),
+                                   clip_end=float(c.get("end", 0.0)),
+                                   transcript=transcript)
             if on_clip:
                 on_clip(idx, title, "Berhasil" if res.success else f"Gagal: {res.error[:100]}")
             if on_progress:
@@ -670,12 +799,22 @@ def export_batch(
                 break
     else:
         with ThreadPoolExecutor(max_workers=max(1, min(3, int(parallel)))) as ex:
-            futs = [ex.submit(render, c) for c in clips]
+            # Map each future back to its source clip. A comprehension variable
+            # (`c`) is scoped to the comprehension itself, so the previous code
+            # raised NameError for every successful clip and silently reported a
+            # fake failure while never notifying Automation.
+            futs = {ex.submit(render, c): c for c in clips}
             for done, fut in enumerate(as_completed(futs), 1):
+                clip = futs.get(fut) or {}
                 try:
                     idx, title, res = fut.result()
                     ok += int(res.success)
                     fail += int(not res.success)
+                    if res.success:
+                        _notify_automation(idx, title, res.output,
+                                           clip_start=float(clip.get("start", 0.0)),
+                                           clip_end=float(clip.get("end", 0.0)),
+                                           transcript=transcript)
                     if on_clip:
                         on_clip(idx, title, "Berhasil" if res.success else f"Gagal: {res.error[:100]}")
                 except Exception as exc:

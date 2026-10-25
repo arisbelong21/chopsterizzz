@@ -2,6 +2,15 @@ import React, { useState, useEffect, useRef, useMemo } from 'react';
 import { useLanguage } from '../locales';
 import { resilientFetch } from '../utils/api';
 import { chooseOutputDirectory, openOutputDirectory } from '../utils/desktopBridge';
+import {
+  hasDesktopBridge,
+  listPublishTemplates,
+  publishStatusSnapshot,
+  publishViaTemplate,
+  subscribePublishStatus,
+} from '../utils/desktopBridge';
+import type { PublishSnapshot } from '../utils/desktopBridge';
+import type { PublishTemplate } from '../utils/desktopBridge';
 import { getAdminHeaders } from '../utils/api';
 import type {
   ViralClip,
@@ -12,6 +21,7 @@ import type {
   CaptionFont,
   TitlePosition,
   StreamerPreset,
+  SplitScreenOption,
   FacecamPosition,
   FontSizeOption,
   TextCaseOption,
@@ -326,6 +336,14 @@ export const ClipStudioSection: React.FC<ClipStudioSectionProps> = ({
   const [backgroundStyle, setBackgroundStyle] = useState<BackgroundStyle>('black');
   const [enableFaceTracking, setEnableFaceTracking] = useState<boolean>(true);
   const [streamerPreset, setStreamerPreset] = useState<StreamerPreset>('none');
+  const [splitScreen, setSplitScreen] = useState<SplitScreenOption>('none');
+  const [splitProbe, setSplitProbe] = useState<{
+    panels: any[];
+    found: boolean;
+    reason: string;
+    layout: string;
+    confidence: number;
+  }>({ panels: [], found: false, reason: '', layout: '', confidence: 0 });
   const [facecamPosition, setFacecamPosition] = useState<FacecamPosition>('auto');
   const [titlePrefix, setTitlePrefix] = useState<string>('');
   const [titleSuffix, setTitleSuffix] = useState<string>('');
@@ -351,6 +369,10 @@ export const ClipStudioSection: React.FC<ClipStudioSectionProps> = ({
   const [tempClearMsg, setTempClearMsg] = useState<string>('');
   const [showClearConfirmModal, setShowClearConfirmModal] = useState<boolean>(false);
   const [isOpeningExportFolder, setIsOpeningExportFolder] = useState<boolean>(false);
+  const [publishTemplates, setPublishTemplates] = useState<PublishTemplate[]>([]);
+  const [publishTemplateId, setPublishTemplateId] = useState<string>('');
+  const [isPublishing, setIsPublishing] = useState<boolean>(false);
+  const [publishStatus, setPublishStatus] = useState<string>('');
 
   // Original Voice Audio Boost (0% - 200%, default 100%)
   const [originalAudioVolume, setOriginalAudioVolume] = useState<number>(100);
@@ -419,6 +441,13 @@ export const ClipStudioSection: React.FC<ClipStudioSectionProps> = ({
   const [isMuted, setIsMuted] = useState<boolean>(true);
   const [isLooping, setIsLooping] = useState<boolean>(true);
   const [playerReady, setPlayerReady] = useState<boolean>(false);
+  // True when the YouTube embed never becomes ready (some videos disallow
+  // embedding) — we show an explanation instead of a blank preview area.
+  const [ytEmbedStuck, setYtEmbedStuck] = useState<boolean>(false);
+  // Set when YouTube's player reports an embed error (101/150).
+  const [ytEmbedError, setYtEmbedError] = useState<boolean>(false);
+  // YouTube embed error code (101/150 = owner disabled embedding elsewhere).
+  const [ytEmbedErrorCode, setYtEmbedErrorCode] = useState<number | null>(null);
 
   // Face & object detection tracking state
   const [faceBox, setFaceBox] = useState<{ cx: number; cy: number; w: number; h: number; found: boolean; type?: string }>({
@@ -433,6 +462,11 @@ export const ClipStudioSection: React.FC<ClipStudioSectionProps> = ({
   const directVideoRef = useRef<HTMLVideoElement | null>(null);
   const ambientVideoRef = useRef<HTMLVideoElement | null>(null);
   const trackingTimerRef = useRef<number | null>(null);
+  // Mirrors the source video into the two panels of the split-screen preview.
+  const splitTopRef = useRef<HTMLVideoElement | null>(null);
+  const splitBottomRef = useRef<HTMLVideoElement | null>(null);
+  // Bounded retries while waiting for the YouTube IFrame API to load.
+  const ytApiTriesRef = useRef(0);
 
   // Keep selectedClips in sync if markedClips updates from outside (including 0 clips)
   useEffect(() => {
@@ -473,12 +507,20 @@ export const ClipStudioSection: React.FC<ClipStudioSectionProps> = ({
     let isMounted = true;
     const fetchFace = async () => {
       try {
-        const res = await fetch(`/api/detect-face?video_id=${encodeURIComponent(videoId)}&timestamp=${clipStart}&video_url=${encodeURIComponent(videoUrl || '')}&facecam_position=${encodeURIComponent(facecamPosition)}&streamer_preset=${encodeURIComponent(streamerPreset)}`);
+        const panelsQuery = splitScreen !== 'none' ? '&with_panels=true' : '';
+        const res = await fetch(`/api/detect-face?video_id=${encodeURIComponent(videoId)}&timestamp=${clipStart}&video_url=${encodeURIComponent(videoUrl || '')}&facecam_position=${encodeURIComponent(facecamPosition)}&streamer_preset=${encodeURIComponent(streamerPreset)}${panelsQuery}`);
         if (res.ok && isMounted) {
           const data = await res.json();
           if (data && typeof data.cx === 'number') {
             setFaceBox(data);
           }
+          setSplitProbe({
+            panels: Array.isArray(data?.panels) ? data.panels : [],
+            found: Boolean(data?.split_found),
+            reason: typeof data?.split_reason === 'string' ? data.split_reason : '',
+            layout: typeof data?.split_layout === 'string' ? data.split_layout : '',
+            confidence: typeof data?.split_confidence === 'number' ? data.split_confidence : 0,
+          });
         }
       } catch (err) {
         console.warn('Face detection fetch failed:', err);
@@ -486,7 +528,61 @@ export const ClipStudioSection: React.FC<ClipStudioSectionProps> = ({
     };
     fetchFace();
     return () => { isMounted = false; };
-  }, [videoId, previewClipIndex, clipStart, videoUrl, facecamPosition, streamerPreset]);
+  }, [videoId, previewClipIndex, clipStart, videoUrl, facecamPosition, streamerPreset, splitScreen]);
+
+  // Split-screen (two_person) preview: the renderer stacks two panels top/bottom
+  // (left/right halves for a single source video). The live preview mirrors the
+  // playing source into two muted clones so the framing is actually visible.
+  const isDirectPreview = Boolean(
+    videoUrl && (
+      videoUrl.endsWith('.mp4') || videoUrl.endsWith('.webm') || videoUrl.endsWith('.mov') ||
+      videoUrl.endsWith('.mkv') || videoUrl.includes('/api/video') || videoUrl.startsWith('blob:') ||
+      videoId?.startsWith('upload_') || videoId?.startsWith('gdrive_')
+    )
+  );
+  const splitBadgeStyle: React.CSSProperties = {
+    position: 'absolute',
+    top: '6px',
+    left: '6px',
+    fontSize: '9px',
+    fontWeight: 800,
+    color: '#e6f6ff',
+    background: 'rgba(0,0,0,0.55)',
+    padding: '2px 6px',
+    borderRadius: '6px',
+    letterSpacing: '0.04em',
+  };
+
+  // Some videos refuse embedding; if the YouTube player never becomes ready,
+  // flag it so the preview area explains itself instead of staying blank.
+  useEffect(() => {
+    if (isDirectPreview || !videoId || playerReady) {
+      setYtEmbedStuck(false);
+      return;
+    }
+    const timer = window.setTimeout(() => setYtEmbedStuck(true), 8000);
+    return () => window.clearTimeout(timer);
+  }, [isDirectPreview, videoId, playerReady]);
+
+  useEffect(() => {
+    if (splitScreen !== 'two_person' || !isDirectPreview) return;
+    const sync = () => {
+      const src = directVideoRef.current;
+      [splitTopRef.current, splitBottomRef.current].forEach(clone => {
+        if (!src || !clone) return;
+        try {
+          if (Math.abs(clone.currentTime - src.currentTime) > 0.2) {
+            clone.currentTime = src.currentTime;
+          }
+          if (src.paused && !clone.paused) clone.pause();
+          if (!src.paused && clone.paused) clone.play().catch(() => {});
+        } catch { /* seeking not ready yet */ }
+      });
+    };
+    sync();
+    const timer = window.setInterval(sync, 250);
+    return () => window.clearInterval(timer);
+  }, [splitScreen, videoUrl]);
 
   // Calculate horizontal crop percentage (0 = leftmost edge, 50 = center, 100 = rightmost edge)
   const previewCropPercent = useMemo(() => {
@@ -539,7 +635,16 @@ export const ClipStudioSection: React.FC<ClipStudioSectionProps> = ({
 
     if (window.YT && window.YT.Player) {
       const container = document.getElementById('studio-preview-yt-container');
-      if (!container) return;
+      if (!container) {
+        // The React tree may not have mounted the player box yet (analysis just
+        // finished). Retry instead of giving up — otherwise the preview stayed
+        // blank until the user refreshed the whole page.
+        ytApiTriesRef.current += 1;
+        if (ytApiTriesRef.current <= 40) {
+          setTimeout(initPreviewPlayer, 350);
+        }
+        return;
+      }
 
       if (previewPlayerRef.current) {
         try {
@@ -599,6 +704,14 @@ export const ClipStudioSection: React.FC<ClipStudioSectionProps> = ({
                 }
               }
             },
+            onError: (event: any) => {
+              // 101/150/etc: the video owner disabled embedding or the video is
+              // restricted. Log the code (shows up as a "js:" line) and surface
+              // it instead of leaving a blank preview.
+              console.warn('[ACS] YouTube embed error code=' + String(event?.data));
+              setYtEmbedErrorCode(Number(event?.data) || null);
+              setYtEmbedError(true);
+            },
           },
         });
       } catch (err) {
@@ -610,7 +723,14 @@ export const ClipStudioSection: React.FC<ClipStudioSectionProps> = ({
         tag.src = 'https://www.youtube.com/iframe_api';
         document.body.appendChild(tag);
       }
-      setTimeout(initPreviewPlayer, 300);
+      // Bounded wait: never spin forever if the IFrame API cannot load
+      // (offline / blocked). After that the preview explains itself.
+      ytApiTriesRef.current += 1;
+      if (ytApiTriesRef.current <= 40) {
+        setTimeout(initPreviewPlayer, 350);
+      } else {
+        setYtEmbedStuck(true);
+      }
     }
   };
 
@@ -664,6 +784,12 @@ export const ClipStudioSection: React.FC<ClipStudioSectionProps> = ({
   };
 
   useEffect(() => {
+    // New source: reset readiness flags and the API retry budget first.
+    setPlayerReady(false);
+    setYtEmbedStuck(false);
+    setYtEmbedError(false);
+    setYtEmbedErrorCode(null);
+    ytApiTriesRef.current = 0;
     initPreviewPlayer();
     return () => {
       stopTracking();
@@ -1350,6 +1476,80 @@ export const ClipStudioSection: React.FC<ClipStudioSectionProps> = ({
     }
   };
 
+  // One-click template publish: templates are configured in Automation → Presets.
+  // Progress + result come from a POLLED snapshot slot (reliable across the Qt
+  // web bridge); the push signal is kept as a best-effort extra.
+  useEffect(() => {
+    let alive = true;
+    let unsubscribe: (() => void) | undefined;
+    (async () => {
+      if (!(await hasDesktopBridge())) return;
+      unsubscribe = await subscribePublishStatus((payload: string) => {
+        try {
+          const data = JSON.parse(payload);
+          if (data && typeof data.ok === 'boolean') {
+            setPublishStatus(String(data.message || ''));
+            setIsPublishing(false);
+            return;
+          }
+        } catch {
+          /* interim progress text, not JSON */
+        }
+        setPublishStatus(payload);
+      });
+      const list = await listPublishTemplates();
+      if (!alive) return;
+      setPublishTemplates(list);
+      setPublishTemplateId(prev => prev || (list[0]?.id ?? ''));
+      // pick up a publish that may still be running from before a reload
+      const snap = await publishStatusSnapshot();
+      if (alive && snap) {
+        if (snap.running) {
+          setIsPublishing(true);
+          setPublishStatus(snap.stage || t.studio.templatePublishWorking);
+        } else if (snap.result) {
+          setPublishStatus(snap.result.message || '');
+        }
+      }
+    })();
+    return () => {
+      alive = false;
+      if (unsubscribe) unsubscribe();
+    };
+  }, [t.studio.templatePublishWorking]);
+
+  // Poll the desktop state while a publish is in flight (and once after).
+  useEffect(() => {
+    if (!isPublishing) return;
+    let alive = true;
+    const poll = async () => {
+      const snap: PublishSnapshot | null = await publishStatusSnapshot();
+      if (!alive || !snap) return;
+      if (snap.stage) setPublishStatus(snap.stage);
+      if (!snap.running) {
+        setIsPublishing(false);
+        if (snap.result) setPublishStatus(snap.result.message || '');
+      }
+    };
+    const timer = window.setInterval(poll, 1200);
+    poll();
+    return () => {
+      alive = false;
+      window.clearInterval(timer);
+    };
+  }, [isPublishing]);
+
+  const handlePublishViaTemplate = async () => {
+    if (!publishTemplateId || isPublishing) return;
+    setIsPublishing(true);
+    setPublishStatus(t.studio.templatePublishWorking);
+    const res = await publishViaTemplate(publishTemplateId);
+    if (!res.ok) {
+      setPublishStatus(res.message);
+      setIsPublishing(false);
+    }
+  };
+
   const handleLaunch = () => {
     const enrichedSelectedClips = selectedClips.map(c => {
       const key = `${c.start_time}_${c.end_time}`;
@@ -1368,6 +1568,7 @@ export const ClipStudioSection: React.FC<ClipStudioSectionProps> = ({
       backgroundStyle,
       enableFaceTracking,
       streamerPreset,
+      splitScreen,
       facecamPosition,
       titleText: enrichedSelectedClips.length === 1 ? activeTitle : undefined,
       titlePrefix,
@@ -1555,6 +1756,53 @@ export const ClipStudioSection: React.FC<ClipStudioSectionProps> = ({
                 <label htmlFor="faceTrackingSec">
                   <strong>{t.studio.faceTracking}</strong> {t.studio.faceTrackingDesc}
                 </label>
+              </div>
+
+              {/* Split-screen compositions (new, optional) */}
+              <div className="studio-sub-toggle" style={{ marginTop: '0.75rem', paddingLeft: '1.6rem' }}>
+                <span className="sub-toggle-label">Split Screen</span>
+                <div className="toggle-pill-group">
+                  <button
+                    type="button"
+                    className={`pill-btn ${splitScreen === 'none' ? 'active' : ''}`}
+                    onClick={() => setSplitScreen('none')}
+                    title="Framing normal (default)."
+                  >
+                    Off
+                  </button>
+                  <button
+                    type="button"
+                    className={`pill-btn ${splitScreen === 'two_person' ? 'active' : ''}`}
+                    onClick={() => setSplitScreen('two_person')}
+                    title="Dua orang tampil permanen dalam panel atas/bawah. Kalau orang/dua feed belum terdeteksi, panel tetap dibuat otomatis (pembagian kiri/kanan)."
+                  >
+                    Two-Person (top/bottom)
+                  </button>
+                  <button
+                    type="button"
+                    className={`pill-btn ${splitScreen === 'reaction_split' ? 'active' : ''}`}
+                    onClick={() => setSplitScreen('reaction_split')}
+                    title="Framing normal tetap, side-by-side hanya saat dua orang bereaksi bersamaan."
+                  >
+                    Reaction Split
+                  </button>
+                </div>
+                {splitScreen !== 'none' && (
+                  <div
+                    style={{ fontSize: '0.72rem', color: 'var(--text-secondary)', marginTop: '0.35rem' }}
+                    title={splitProbe.reason || undefined}
+                  >
+                    {splitProbe.found && splitProbe.panels.length === 2
+                      ? `${splitProbe.layout === 'side_by_side'
+                          ? 'Video sudah split dua feed (kiri/kanan) — tiap feed jadi satu panel'
+                          : '2 orang terdeteksi pada frame ini'} — ${splitScreen === 'two_person'
+                          ? 'panel atas/bawah aktif'
+                          : 'momen reaksi siap dianalisis'}.`
+                      : splitScreen === 'reaction_split'
+                        ? 'Belum ada dua orang aktif pada frame ini — renderer mencari momen reaksi di seluruh clip.'
+                        : 'Mode Two-Person aktif — panel atas/bawah tetap dirender (pembagian kiri/kanan otomatis) walau frame ini belum menunjukkan 2 orang / dua feed.'}
+                  </div>
+                )}
               </div>
 
               {enableFaceTracking && streamerPreset === 'none' && (
@@ -2809,6 +3057,23 @@ export const ClipStudioSection: React.FC<ClipStudioSectionProps> = ({
                       onChange={e => setWatermarkSize(Number(e.target.value))}
                     />
                     <div className="slider-quick-buttons" style={{ display: 'flex', flexWrap: 'wrap', gap: '0.35rem', marginTop: '0.35rem' }}>
+                      {/* Tell the user what the % means in the FINAL 1080p frame,
+                          so "looks small in preview, big on the phone" is no
+                          longer a surprise. */}
+                      <span
+                        style={{
+                          fontSize: '0.68rem',
+                          color: 'var(--text-muted)',
+                          width: '100%',
+                          marginBottom: '0.15rem',
+                        }}
+                      >
+                        {watermarkSize > 0
+                          ? (watermarkType === 'text'
+                              ? `≈ ${Math.round(180 * (watermarkSize / 100))} px ukuran huruf pada video 1080p`
+                              : `≈ ${Math.round((isLandscape ? 1920 : 1080) * (watermarkSize / 100))} px lebar pada video ${isLandscape ? '1920' : '1080'}p (lebar ${watermarkSize}% dari frame)`)
+                          : 'Watermark disembunyikan (0%)'}
+                      </span>
                       {[10, 25, 50, 100, 200, 350, 500].map(sz => (
                         <button
                           key={sz}
@@ -3411,6 +3676,11 @@ export const ClipStudioSection: React.FC<ClipStudioSectionProps> = ({
                           }}
                         />
                       ) : (
+                        /* MUST stay childless in JSX: the YouTube IFrame API
+                           REPLACES its slot node with an <iframe>, and React
+                           cannot remove a node it did not keep — that threw
+                           removeChild errors and blanked the preview. The slot
+                           is created from JS inside initPreviewPlayer(). */
                         <div
                           id="studio-preview-yt-container"
                           className="studio-yt-embed-slot"
@@ -3419,9 +3689,201 @@ export const ClipStudioSection: React.FC<ClipStudioSectionProps> = ({
                             transition: 'opacity 0.25s ease',
                             ['--preview-crop-pct' as any]: previewCropPercent,
                           }}
+                        />
+                      )}
+
+                      {/* Instant poster: the analysis result arrives before the
+                          YouTube player has booted, so show the thumbnail plus a
+                          play button right away instead of a blank box (no page
+                          refresh needed). */}
+                      {!isDirectPreview && videoId && !playerReady && !ytEmbedStuck && !ytEmbedError && (
+                        <div
+                          style={{
+                            position: 'absolute',
+                            inset: 0,
+                            // Above the click overlay (z-index 15) so the ▶ button
+                            // is clickable; the wrapper itself ignores pointer
+                            // events so taps elsewhere still reach the player.
+                            zIndex: 16,
+                            display: 'flex',
+                            alignItems: 'center',
+                            justifyContent: 'center',
+                            background: '#000',
+                            pointerEvents: 'none',
+                          }}
                         >
-                          <div id="studio-yt-iframe-slot"></div>
+                          <img
+                            src={`https://img.youtube.com/vi/${videoId}/hqdefault.jpg`}
+                            alt=""
+                            style={{
+                              width: '100%',
+                              height: '100%',
+                              objectFit: 'cover',
+                              opacity: 0.88,
+                              pointerEvents: 'none',
+                            }}
+                          />
+                          <button
+                            type="button"
+                            onClick={(e) => { e.stopPropagation(); initPreviewPlayer(); togglePlayPause(); }}
+                            title="Putar pratinjau"
+                            style={{
+                              position: 'absolute',
+                              pointerEvents: 'auto',
+                              width: '56px',
+                              height: '56px',
+                              borderRadius: '50%',
+                              border: '1px solid rgba(255,255,255,0.55)',
+                              background: 'rgba(2,6,23,0.62)',
+                              color: '#fff',
+                              fontSize: '20px',
+                              lineHeight: 1,
+                              cursor: 'pointer',
+                            }}
+                          >
+                            ▶
+                          </button>
                         </div>
+                      )}
+
+                      {/* Explains a YouTube embed that refuses to load. Kept
+                          OUTSIDE the player container so React never touches
+                          the DOM the YouTube API owns. */}
+                      {!isDirectPreview && (ytEmbedStuck || ytEmbedError) && (
+                        <div
+                          style={{
+                            position: 'absolute',
+                            inset: 0,
+                            zIndex: 12,
+                            pointerEvents: 'none',
+                            display: 'flex',
+                            flexDirection: 'column',
+                            alignItems: 'center',
+                            justifyContent: 'center',
+                            gap: '8px',
+                            padding: '10px',
+                          }}
+                        >
+                          {videoId && (
+                            <img
+                              src={`https://img.youtube.com/vi/${videoId}/hqdefault.jpg`}
+                              alt=""
+                              style={{
+                                maxWidth: '72%',
+                                borderRadius: '8px',
+                                border: '1px solid rgba(56,189,248,0.35)',
+                                opacity: 0.9,
+                              }}
+                            />
+                          )}
+                          <div
+                            style={{
+                              maxWidth: '86%',
+                              textAlign: 'center',
+                              fontSize: '10px',
+                              fontWeight: 700,
+                              lineHeight: 1.45,
+                              color: 'rgba(226,232,240,0.92)',
+                              background: 'rgba(2,6,23,0.72)',
+                              border: '1px solid rgba(56,189,248,0.35)',
+                              borderRadius: '8px',
+                              padding: '8px 10px',
+                            }}
+                          >
+                            {ytEmbedErrorCode === 150 || ytEmbedErrorCode === 101
+                              ? <>Video ini <b>tidak bisa diputar di sini</b> — channel-nya
+                                  menonaktifkan pemutaran di situs lain
+                                  (YouTube error {ytEmbedErrorCode}).</>
+                              : <>Pratinjau YouTube tidak dapat dimuat untuk video ini.</>}
+                            <br />
+                            <b>Unduh videonya secara manual</b>, lalu masukkan kembali lewat
+                            fitur <b>pilih file / upload</b> agar bisa dipratinjau
+                            dan diproses seperti biasa.
+                            <br />
+                            Analisis &amp; Render tetap berjalan.
+                            {videoId ? <><br />ID: {videoId}</> : null}
+                          </div>
+                        </div>
+                      )}
+
+                      {/* Split-screen preview (two-person top/bottom) — only for
+                          direct video files, so it can never cover the YouTube
+                          player or hide the source preview. */}
+                      {splitScreen === 'two_person' && isDirectPreview && (
+                        <div
+                          style={{
+                            position: 'absolute',
+                            inset: 0,
+                            zIndex: 11,
+                            display: 'flex',
+                            flexDirection: 'column',
+                            pointerEvents: 'none',
+                            background: '#000',
+                          }}
+                        >
+                          <div style={{ position: 'relative', flex: 1, overflow: 'hidden' }}>
+                            <video
+                              ref={splitTopRef}
+                              src={videoUrl}
+                              muted
+                              playsInline
+                              style={{ width: '100%', height: '100%', objectFit: 'cover', objectPosition: '25% 50%' }}
+                            />
+                            <span style={splitBadgeStyle}>PANEL 1 · ORANG A</span>
+                          </div>
+                          <div style={{ height: '3px', background: 'rgba(56,189,248,0.7)', boxShadow: '0 0 8px rgba(56,189,248,0.85)' }} />
+                          <div style={{ position: 'relative', flex: 1, overflow: 'hidden' }}>
+                            <video
+                              ref={splitBottomRef}
+                              src={videoUrl}
+                              muted
+                              playsInline
+                              style={{ width: '100%', height: '100%', objectFit: 'cover', objectPosition: '75% 50%' }}
+                            />
+                            <span style={splitBadgeStyle}>PANEL 2 · ORANG B</span>
+                          </div>
+                          <span
+                            style={{
+                              position: 'absolute',
+                              left: '50%',
+                              bottom: '4px',
+                              transform: 'translateX(-50%)',
+                              fontSize: '9px',
+                              fontWeight: 700,
+                              color: 'rgba(255,255,255,0.78)',
+                              background: 'rgba(0,0,0,0.5)',
+                              padding: '2px 6px',
+                              borderRadius: '6px',
+                              whiteSpace: 'nowrap',
+                            }}
+                          >
+                            Preview dua panel — komposisi final diterapkan saat Render
+                          </span>
+                        </div>
+                      )}
+
+                      {/* YouTube/embed source: keep the player visible — just a
+                          small note that the split is applied at Render time. */}
+                      {splitScreen === 'two_person' && !isDirectPreview && (
+                        <span
+                          style={{
+                            position: 'absolute',
+                            left: '50%',
+                            bottom: '8px',
+                            transform: 'translateX(-50%)',
+                            zIndex: 11,
+                            pointerEvents: 'none',
+                            fontSize: '9px',
+                            fontWeight: 700,
+                            color: 'rgba(255,255,255,0.8)',
+                            background: 'rgba(0,0,0,0.55)',
+                            padding: '2px 7px',
+                            borderRadius: '6px',
+                            whiteSpace: 'nowrap',
+                          }}
+                        >
+                          Split Two-Person aktif — diterapkan saat Render
+                        </span>
                       )}
 
                       {/* Click overlay to toggle play/pause */}
@@ -3642,7 +4104,10 @@ export const ClipStudioSection: React.FC<ClipStudioSectionProps> = ({
                       <span
                         className="wm-text-badge"
                         style={{
-                          fontSize: watermarkSize === 0 ? '0px' : `${Math.max(8, Math.round((watermarkSize / 100) * 56))}px`,
+                          // Same maths as the renderer (font = 180 * size/100 on
+                          // a 1080-wide canvas, 1920 for landscape) scaled to the
+                          // preview box so the preview matches the final video.
+                          fontSize: watermarkSize === 0 ? '0px' : `${Math.max(8, Math.round((180 * (watermarkSize / 100)) * (phoneWidth / (isLandscape ? 1920 : 1080))))}px`,
                           display: watermarkSize === 0 ? 'none' : 'inline-block',
                           pointerEvents: 'none',
                         }}
@@ -3922,31 +4387,6 @@ export const ClipStudioSection: React.FC<ClipStudioSectionProps> = ({
                       </button>
                     )}
 
-                    {(batchProgress.overall_status === 'completed' || batchProgress.clips.some(c => c.status === 'completed')) && (
-                      <a
-                        href={batchProgress.zip_url || `/api/download-batch-zip/${batchProgress.batch_id}`}
-                        download={`chopster_by_aris_autoclip_${batchProgress.batch_id}.zip`}
-                        className="glowing-btn batch-zip-download-btn"
-                        style={{
-                          display: 'flex',
-                          alignItems: 'center',
-                          gap: '0.35rem',
-                          background: 'linear-gradient(135deg, #10b981 0%, #059669 100%)',
-                          border: '1px solid rgba(16, 185, 129, 0.6)',
-                          color: '#ffffff',
-                          fontWeight: 700,
-                          fontSize: '0.72rem',
-                          padding: '0.3rem 0.65rem',
-                          borderRadius: '6px',
-                          textDecoration: 'none',
-                          boxShadow: '0 0 12px rgba(16, 185, 129, 0.35)',
-                          cursor: 'pointer',
-                        }}
-                      >
-                        📦 ZIP
-                      </a>
-                    )}
-
                     {(batchProgress.overall_status === 'completed' || batchProgress.overall_status === 'error') && onDismissProgress && (
                       <button
                         type="button"
@@ -4218,6 +4658,102 @@ export const ClipStudioSection: React.FC<ClipStudioSectionProps> = ({
           <span className="meta-sub">
             {t.studio.outputMetaSub}
           </span>
+        </div>
+
+        {/* One-click automasi: publish semua hasil render ACS lewat template */}
+        <div
+          className="studio-template-publish"
+          style={{
+            display: 'flex',
+            alignItems: 'center',
+            gap: '0.45rem',
+            flexWrap: 'wrap',
+            justifyContent: 'flex-end',
+            maxWidth: 'min(48vw, 640px)',
+          }}
+        >
+          <select
+            value={publishTemplateId}
+            onChange={e => setPublishTemplateId(e.target.value)}
+            disabled={publishTemplates.length === 0 || isPublishing}
+            title={t.studio.templatePublishHint}
+            style={{
+              border: '1px solid rgba(56, 189, 248, 0.4)',
+              background: 'rgba(56, 189, 248, 0.08)',
+              color: 'var(--text-primary)',
+              borderRadius: '7px',
+              padding: '0.34rem 0.55rem',
+              fontSize: '0.7rem',
+              fontWeight: 700,
+              maxWidth: '220px',
+            }}
+          >
+            {publishTemplates.length === 0 ? (
+              <option value="">{t.studio.templatePublishNone}</option>
+            ) : (
+              publishTemplates.map(tpl => (
+                <option key={tpl.id} value={tpl.id}>
+                  {tpl.name}
+                </option>
+              ))
+            )}
+          </select>
+          {(() => {
+            // Route summary of the selected template (API vs browser draft), so
+            // the user knows what the one-click publish will actually do.
+            const selected = publishTemplates.find(tpl => tpl.id === publishTemplateId);
+            if (!selected || !selected.modes) return null;
+            return (
+              <span
+                title={selected.modes}
+                style={{
+                  fontSize: '0.66rem',
+                  color: 'var(--text-secondary)',
+                  maxWidth: '300px',
+                  overflow: 'hidden',
+                  textOverflow: 'ellipsis',
+                  whiteSpace: 'nowrap',
+                }}
+              >
+                {selected.modes}
+              </span>
+            );
+          })()}
+          <button
+            type="button"
+            onClick={handlePublishViaTemplate}
+            disabled={!publishTemplateId || isPublishing}
+            title={t.studio.templatePublishHint}
+            style={{
+              border: '1px solid rgba(56, 189, 248, 0.55)',
+              background:
+                'linear-gradient(180deg, rgba(56,189,248,0.30), rgba(56,189,248,0.14))',
+              color: 'var(--text-primary)',
+              borderRadius: '9px',
+              padding: '0.44rem 0.85rem',
+              fontSize: '0.72rem',
+              fontWeight: 800,
+              cursor: !publishTemplateId || isPublishing ? 'not-allowed' : 'pointer',
+              whiteSpace: 'nowrap',
+            }}
+          >
+            {isPublishing ? t.studio.templatePublishBusy : `⚡ ${t.studio.templatePublishButton}`}
+          </button>
+          {publishStatus && (
+            <span
+              title={publishStatus}
+              style={{
+                fontSize: '0.68rem',
+                color: 'var(--text-secondary)',
+                maxWidth: '260px',
+                overflow: 'hidden',
+                textOverflow: 'ellipsis',
+                whiteSpace: 'nowrap',
+              }}
+            >
+              {publishStatus}
+            </span>
+          )}
         </div>
 
         <button

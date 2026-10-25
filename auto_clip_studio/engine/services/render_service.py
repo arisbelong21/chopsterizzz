@@ -2,7 +2,6 @@ import asyncio
 import logging
 import os
 import re
-import zipfile
 from typing import Any, Dict, List, Optional
 
 from chopster.auto_clip_studio.engine.config import (
@@ -30,7 +29,8 @@ async def render_single_batch_clip(
     settings: RenderSettingsModel,
     target_url: str,
     transcript: Optional[List[Dict[str, Any]]] = None,
-    total_clips: int = 1
+    total_clips: int = 1,
+    language: Optional[str] = "auto"
 ):
     batch = RENDER_BATCHES.get(batch_id)
     if not batch:
@@ -162,8 +162,8 @@ async def render_single_batch_clip(
         clip_status["status"] = "rendering"
         clip_status["progress_percent"] = 70
 
-        out_filename = f"clip_{idx+1}_{batch_id}.mp4"
         output_dir = resolve_output_directory(settings.output_dir)
+        out_filename = build_output_filename(base_title, settings, output_dir, idx + 1)
         out_path = str(output_dir / out_filename)
 
         await asyncio.to_thread(
@@ -198,7 +198,8 @@ async def render_single_batch_clip(
             hook_sfx_volume=float((settings.hook_sfx_volume if settings.hook_sfx_volume is not None else 100.0) / 100.0),
             original_audio_volume=float((settings.original_audio_volume if settings.original_audio_volume is not None else 100.0) / 100.0),
             hardware_accel=settings.hardware_accel or "auto",
-            title_y_percent=settings.title_y_percent
+            title_y_percent=settings.title_y_percent,
+            split_screen=getattr(settings, "split_screen", "none") or "none",
         )
 
         if not os.path.exists(out_path) or not is_valid_mp4(out_path):
@@ -208,6 +209,47 @@ async def render_single_batch_clip(
         clip_status["progress_percent"] = 100
         clip_status["download_url"] = f"/api/download-rendered/{out_filename}"
         clip_status["output_path"] = out_path
+        # Automation handoff (spec §29): fire-and-forget; publishing can never
+        # turn a successful render into a render failure.
+        try:
+            # Bind the analysed transcript to this clip so the AI Content Pack
+            # describes the actual clip window, not the video opening (spec 4.4).
+            clip_context = None
+            try:
+                from chopster.automation.context import build_clip_context, segments_from_words
+                lines = segments_from_words(words) if words else []
+                if not lines and isinstance(transcript, list) and transcript:
+                    lines = transcript
+                if lines:
+                    ctx = build_clip_context(
+                        source="acs",
+                        source_asset_id=f"{batch_id}:{idx}",
+                        project_id=str(batch.get("project_id") or "") if isinstance(batch, dict) else "",
+                        media_path=out_path,
+                        title=str(clip_status.get("base_title") or ""),
+                        # Propagate the analysis output language so downstream AI caption/hook
+                        # generation keeps the video's real language instead of defaulting to "id".
+                        language=(language or "auto"),
+                        clip_start=0.0,
+                        clip_end=round(float(duration_sec), 3),
+                        segments=lines,
+                        evidence="transcript yang dianalisis Auto Clip Studio untuk clip ini",
+                    )
+                    clip_context = ctx.to_dict()
+            except Exception:
+                clip_context = None
+            from chopster.automation.events import emit_render_completed
+            emit_render_completed({
+                "batch_id": batch_id,
+                "clip_index": idx,
+                "clip_id": f"{batch_id}:{idx}",
+                "clip_context": clip_context,
+                "output_path": out_path,
+                "title": str(clip_status.get("base_title") or clip.get("title_suggestion") or clip.get("custom_title") or ""),
+                "project_id": str(batch.get("project_id") or "") if isinstance(batch, dict) else "",
+            })
+        except Exception:
+            pass
 
     except Exception as e:
         logger.error(f"Error rendering clip {idx} in batch {batch_id}: {e}")
@@ -228,42 +270,47 @@ async def render_single_batch_clip(
                 pass
 
 
-def update_batch_summary_and_zip(batch_id: str, settings: RenderSettingsModel):
+def _sanitize_file_component(value: str, fallback: str = "") -> str:
+    """Strip characters that are illegal in Windows file names."""
+    clean = re.sub(r'[\\/*?:"<>|]', "", str(value or ""))
+    clean = re.sub(r"\s+", " ", clean).strip()
+    return clean[:80].strip() or fallback
+
+
+def build_output_filename(base_title: str, settings: RenderSettingsModel,
+                          output_dir, index: int) -> str:
+    """Name the rendered clip after its AI title (plus the user's prefix/suffix).
+
+    Rendered files used to be ``clip_1_<batch>.mp4``, which made downloads and
+    the output folder meaningless. Duplicate titles get a numeric suffix so a
+    file is never overwritten.
     """
-    Updates the batch ZIP archive and computes overall status and friendly messages.
+    prefix = _sanitize_file_component(settings.file_name_prefix or "")
+    suffix = _sanitize_file_component(settings.file_name_suffix or "")
+    core = _sanitize_file_component(base_title or "", f"clip_{index}")
+    name = f"{prefix}{core}{suffix}".strip() or f"clip_{index}"
+    candidate = f"{name}.mp4"
+    counter = 1
+    try:
+        while (output_dir / candidate).exists():
+            candidate = f"{name} ({counter}).mp4"
+            counter += 1
+    except Exception:
+        pass
+    return candidate
+
+
+def update_batch_summary_and_zip(batch_id: str, settings: RenderSettingsModel):
+    """Computes the batch's overall status and friendly messages.
+
+    The batch ZIP bundle is intentionally NOT produced any more (the user did
+    not want ZIP files); clip files keep their AI-title names instead.
     """
     batch = RENDER_BATCHES.get(batch_id)
     if not batch:
         return
 
-    # Generate/update ZIP bundle for the batch with title-based filenames and duplicate handling
-    try:
-        completed_clips = [c for c in batch["clips"] if c.get("status") == "completed" and c.get("download_url")]
-        if completed_clips:
-            zip_filename = f"chopster_by_aris_autoclip_{batch_id}.zip"
-            output_dir = resolve_output_directory(settings.output_dir)
-            zip_path = output_dir / zip_filename
-            title_counts: Dict[str, int] = {}
-            # MP4 is already compressed; storing it avoids wasting CPU on deflate.
-            with zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_STORED) as zipf:
-                for c in completed_clips:
-                    fname = c["download_url"].split("?")[0].split("/")[-1]
-                    fpath = output_dir / fname
-                    if fpath.exists():
-                        raw_title = (c.get("base_title") or c.get("title") or "").strip()
-                        clean_title = re.sub(r'[\\/*?:"<>|]', "", raw_title) or f"clip_{c.get('clip_index', 1)}"
-                        fn_pfx = re.sub(r'[\\/*?:"<>|]', "", settings.file_name_prefix or "")
-                        fn_sfx = re.sub(r'[\\/*?:"<>|]', "", settings.file_name_suffix or "")
-                        formatted_name = f"{fn_pfx}{clean_title}{fn_sfx}".strip() or clean_title
-                        count = title_counts.get(formatted_name, 0)
-                        title_counts[formatted_name] = count + 1
-                        arc_name = f"{formatted_name}.mp4" if count == 0 else f"{formatted_name} ({count}).mp4"
-                        zipf.write(fpath, arcname=arc_name)
-            batch["zip_url"] = f"/api/download-batch-zip/{batch_id}"
-        else:
-            batch["zip_url"] = None
-    except Exception as e:
-        logger.warning(f"Failed to create batch zip: {e}")
+    batch["zip_url"] = None
 
     # Determine overall status and error messaging
     failed_clips = [c for c in batch["clips"] if c.get("status") == "error"]
@@ -316,7 +363,8 @@ async def process_batch_rendering(batch_id: str, request: RenderBatchRequest):
             settings=settings,
             target_url=target_url,
             transcript=request.transcript,
-            total_clips=len(clips)
+            total_clips=len(clips),
+            language=(request.language or "auto")
         )
         # Fallback continuation: regardless of whether clip succeeded or failed, proceed to next clip!
         batch["current_clip_index"] = idx + 1

@@ -12,7 +12,7 @@ from PySide6.QtWidgets import (
 )
 
 from chopster.app.configuration import FILENAME_TEMPLATES, QUALITIES, FORMATS, SPEED_PRESETS
-from chopster.ui.theme import THEMES
+from chopster.ui.theme import THEMES, THEME_NAMES
 from chopster.ui.components.cards import Card
 
 
@@ -174,8 +174,12 @@ class SettingsPage(QWidget):
         al.setContentsMargins(16, 12, 16, 12)
         al.addWidget(self._lbl("TEMA", acard))
         self.theme_cb = QComboBox(acard)
-        self.theme_cb.addItems(["dark", "light"])
-        self.theme_cb.setCurrentText(self.app.config.get("theme") or "dark")
+        for _tid in ("dark", "modern", "3d", "casual"):
+            _label = THEME_NAMES.get(_tid, _tid)
+            self.theme_cb.addItem(_label, _tid)
+        _cur_theme = self.app.config.get("theme") or "dark"
+        _idx = self.theme_cb.findData(_cur_theme)
+        self.theme_cb.setCurrentIndex(_idx if _idx >= 0 else 0)
         al.addWidget(self.theme_cb)
         al.addStretch()
         lay.addWidget(acard)
@@ -425,6 +429,122 @@ class SettingsPage(QWidget):
         sl.addWidget(clear_btn)
         lay.addWidget(scard)
 
+        # Automation (publishing/scheduling engine)
+        acard = QFrame(container)
+        acard.setObjectName("card")
+        al = QVBoxLayout(acard)
+        al.addWidget(self._section_title("AUTOMATION", acard))
+        al.addWidget(self._lbl("Automation memakai Jalur API resmi platform (YouTube/Meta/TikTok) dan opsional Browser Session untuk Instagram. Semua token disimpan terenkripsi DPAPI — tidak pernah masuk settings.json atau log.", acard))
+        row_a1 = QHBoxLayout()
+        row_a1.addWidget(QLabel("Max concurrent jobs", acard))
+        self.aut_max_concurrent = QSpinBox(acard)
+        self.aut_max_concurrent.setRange(1, 8)
+        self.aut_max_concurrent.setValue(int(self.app.config.get("aut_max_concurrent") or 2))
+        row_a1.addWidget(self.aut_max_concurrent)
+        row_a1.addWidget(QLabel("Retry maksimal", acard))
+        self.aut_retry_limit = QSpinBox(acard)
+        self.aut_retry_limit.setRange(1, 10)
+        self.aut_retry_limit.setValue(int(self.app.config.get("aut_retry_limit") or 3))
+        row_a1.addWidget(self.aut_retry_limit)
+        row_a1.addSpacing(16)
+        row_a1.addWidget(QLabel("Publishing fallback", acard))
+        self.aut_publish_fallback = QComboBox(acard)
+        self.aut_fallback_map = {"Ask me": "ask", "Automatically use browser fallback": "browser", "API only": "api"}
+        self.aut_fallback_rev = {"ask": "Ask me", "browser": "Automatically use browser fallback", "api": "API only"}
+        self.aut_publish_fallback.addItems(["Ask me", "Automatically use browser fallback", "API only"])
+        current_fb = str(self.app.config.get("aut_publish_fallback") or "ask")
+        self.aut_publish_fallback.setCurrentText(self.aut_fallback_rev.get(current_fb, "Ask me"))
+        row_a1.addWidget(self.aut_publish_fallback)
+        row_a1.addStretch()
+        al.addLayout(row_a1)
+        self.aut_acs_handoff = QCheckBox("Otomatis daftarkan clip hasil render Auto Clip Studio sebagai media siap publish", acard)
+        self.aut_acs_handoff.setChecked(bool(self.app.config.get("aut_acs_handoff", True)))
+        al.addWidget(self.aut_acs_handoff)
+        self.aut_cca_handoff = QCheckBox("Otomatis daftarkan clip hasil export Content Clipper AI sebagai media siap publish", acard)
+        self.aut_cca_handoff.setChecked(bool(self.app.config.get("aut_cca_handoff", True)))
+        al.addWidget(self.aut_cca_handoff)
+        self.aut_autopilot_enabled = QCheckBox("Aktifkan Auto-Pilot (rule aktif otomatis menjadwalkan klip baru)", acard)
+        self.aut_autopilot_enabled.setChecked(bool(self.app.config.get("aut_autopilot_enabled", True)))
+        al.addWidget(self.aut_autopilot_enabled)
+        model_row = QHBoxLayout()
+        model_row.addWidget(self._lbl("MODEL WHISPER — AI CONTENT PACK", acard))
+        self.aut_pack_model = QComboBox(acard)
+        try:
+            from chopster.automation.local_transcribe import PACK_MODELS, pack_whisper_model
+            self.aut_pack_model.addItems(list(PACK_MODELS))
+            self.aut_pack_model.setCurrentText(pack_whisper_model(self.app.config))
+        except Exception:
+            self.aut_pack_model.addItems(["small", "medium", "large-v2", "large-v3"])
+            self.aut_pack_model.setCurrentText("small")
+        model_row.addWidget(self.aut_pack_model)
+        model_row.addWidget(self._lbl(
+            "Dipakai Studio Automation untuk video yang belum punya transkrip sendiri "
+            "(import dari komputer). Minimal small — tiny/base terlalu berisik sehingga "
+            "deskripsi AI jadi generik.", acard))
+        model_row.addStretch()
+        al.addLayout(model_row)
+        row_a2 = QHBoxLayout()
+        self.aut_headless = QCheckBox("Jalankan browser headless (advanced)", acard)
+        self.aut_headless.setChecked(bool(self.app.config.get("aut_browser_headless")))
+        self.aut_keep_diag = QCheckBox("Simpan screenshot diagnostik saat gagal", acard)
+        self.aut_keep_diag.setChecked(bool(self.app.config.get("aut_keep_diagnostics")))
+        self.aut_minimize = QCheckBox("Minimalkan jendela browser saat publish", acard)
+        self.aut_minimize.setChecked(bool(self.app.config.get("aut_browser_minimize")))
+        row_a2.addWidget(self.aut_headless)
+        row_a2.addWidget(self.aut_keep_diag)
+        row_a2.addWidget(self.aut_minimize)
+        row_a2.addStretch()
+        al.addLayout(row_a2)
+        row_a2b = QHBoxLayout()
+        row_a2b.addWidget(QLabel("Browser engine", acard))
+        self.aut_browser_channel = QComboBox(acard)
+        self.aut_channel_map = {
+            "Microsoft Edge (terpasang)": "msedge",
+            "Google Chrome (terpasang)": "chrome",
+            "Chromium Playwright (bundled)": "bundled",
+        }
+        self.aut_channel_rev = {v: k for k, v in self.aut_channel_map.items()}
+        self.aut_browser_channel.addItems(list(self.aut_channel_map))
+        self.aut_browser_channel.setCurrentText(
+            self.aut_channel_rev.get(str(self.app.config.get("aut_browser_channel") or "msedge"),
+                                     "Microsoft Edge (terpasang)"))
+        row_a2b.addWidget(self.aut_browser_channel)
+        row_a2b.addSpacing(16)
+        row_a2b.addWidget(QLabel("TikTok publish path", acard))
+        self.aut_tiktok_mode = QComboBox(acard)
+        self.aut_tiktok_map = {"Inbox draft (aman, video.upload)": "inbox",
+                               "Direct Post (video.publish)": "direct"}
+        self.aut_tiktok_rev = {v: k for k, v in self.aut_tiktok_map.items()}
+        self.aut_tiktok_mode.addItems(list(self.aut_tiktok_map))
+        self.aut_tiktok_mode.setCurrentText(
+            self.aut_tiktok_rev.get(str(self.app.config.get("aut_tiktok_mode") or "inbox"),
+                                    "Inbox draft (aman, video.upload)"))
+        row_a2b.addWidget(self.aut_tiktok_mode)
+        row_a2b.addStretch()
+        al.addLayout(row_a2b)
+        al.addWidget(self._lbl(
+            "TikTok Inbox = Chopster mengirim draft ke inbox TikTok (butuh scope video.upload); "
+            "kamu tekan publish di aplikasi TikTok. Direct Post = Chopster menayangkan sendiri "
+            "(butuh video.publish dan app lolos audit). Browser engine = Edge/Chrome terpasang, "
+            "jadi tidak perlu unduh Chromium.", acard))
+        al.addWidget(self._lbl(
+            "Catatan khusus TikTok Inbox: endpoint draft hanya menerima file video — judul/caption "
+            "yang kamu isi di Chopster tidak ikut terkirim, jadi caption ditulis di aplikasi TikTok "
+            "sebelum menekan Post. Judul/caption otomatis hanya berlaku di mode Direct Post.",
+            acard))
+        row_a3 = QHBoxLayout()
+        self.aut_secret_state = QLabel("", acard)
+        self.aut_secret_state.setStyleSheet(f"color: {C['FOOT']}; font-size:10px;")
+        row_a3.addWidget(self.aut_secret_state)
+        row_a3.addStretch()
+        clear_sessions = QPushButton("Bersihkan browser sessions", acard)
+        clear_sessions.setObjectName("ghost")
+        clear_sessions.clicked.connect(self._clear_browser_sessions)
+        row_a3.addWidget(clear_sessions)
+        al.addLayout(row_a3)
+        lay.addWidget(acard)
+        self._refresh_automation_status()
+
         # Save
         save = QPushButton("💾  Simpan Pengaturan", container)
         save.setObjectName("primary")
@@ -571,6 +691,53 @@ class SettingsPage(QWidget):
             QMessageBox.information(self, "Cache", "Cache dibersihkan.")
         except Exception as exc:
             QMessageBox.warning(self, "Cache", str(exc))
+
+    def _refresh_automation_status(self):
+        try:
+            from chopster.app.secret_store import WindowsSecretStore
+            from chopster.app.paths import user_data_dir
+            store = WindowsSecretStore(user_data_dir())
+            if not store.available:
+                state = "DPAPI tidak tersedia di platform ini"
+            elif store.path.exists():
+                state = "aktif (DPAPI-encrypted) ✓"
+            else:
+                state = "DPAPI aktif – belum ada secret"
+            if hasattr(self, "aut_secret_state"):
+                self.aut_secret_state.setText(f"Secret storage: {state}")
+        except Exception as exc:
+            if hasattr(self, "aut_secret_state"):
+                self.aut_secret_state.setText(f"Secret storage: {exc}")
+
+    def _clear_browser_sessions(self):
+        if QMessageBox.question(self, "Browser Sessions", "Hapus semua profil browser session Chopster (Instagram dll)? Login harus diulang.") != QMessageBox.Yes:
+            return
+        errors = []
+        from chopster.automation.browser.session import clear_session
+        # Per-account profiles live at profiles/<platform>/<account_id>; clear them
+        # explicitly first, then the legacy per-platform folder. Without this the
+        # button left the real (account-scoped) sessions behind.
+        try:
+            mgr = getattr(self.app, "automation", None)
+            db = getattr(mgr, "db", None)
+            for acc in (db.automation_list_accounts() if db else []):
+                if str(acc.get("auth_mode") or "") != "browser":
+                    continue
+                try:
+                    clear_session(str(acc.get("platform") or ""), str(acc.get("id") or ""))
+                except Exception as exc:
+                    errors.append(f"{acc.get('platform')}/{acc.get('id')}: {exc}")
+        except Exception as exc:
+            errors.append(f"accounts: {exc}")
+        for platform in ("instagram", "facebook", "tiktok", "youtube"):
+            try:
+                clear_session(platform)
+            except Exception as exc:
+                errors.append(f"{platform}: {exc}")
+        if errors:
+            QMessageBox.warning(self, "Browser Sessions", "\n".join(errors)[:600])
+        else:
+            QMessageBox.information(self, "Browser Sessions", "Semua session Chopster dihapus.")
 
     def _ai_provider_changed(self):
         """Show/hide fields based on explicit provider choice."""
@@ -798,7 +965,11 @@ class SettingsPage(QWidget):
         def done(res):
             used_model=str(res.get("model") or "")
             verified = not str(res.get("provider") or "").startswith("local")
-            self._record_vision_test(used_model, verified, provider=provider, endpoint=endpoint)
+            tested_model = (
+                str(probe_model or used_model).strip()
+                if provider == "gateway" else used_model
+            )
+            self._record_vision_test(tested_model, verified, provider=provider, endpoint=endpoint)
             if verified:
                 self.ai_status.setText(f"✅ Model terverifikasi Teks + gambar • model: {used_model or 'Auto'}. Tugas visual kini dapat memakai AI ini.")
             else:
@@ -861,7 +1032,11 @@ class SettingsPage(QWidget):
             return {"model":str(raw.get("model") or vision_model or "auto"),"text":r.text,"provider":str(raw.get("provider") or p.name), "verified": True}
         def done(result):
             used_model=str(result.get("model") or "")
-            self._record_vision_test(used_model, bool(result.get("verified")), provider=provider, endpoint=endpoint)
+            tested_model = (
+                str(vision_model or used_model).strip()
+                if provider == "gateway" else used_model
+            )
+            self._record_vision_test(tested_model, bool(result.get("verified")), provider=provider, endpoint=endpoint)
             self.ai_status.setText(f"✅ AI Vision (global) aktif • model: {used_model} • Teks + gambar terverifikasi")
             self.ai_embedded_test_btn.setEnabled(True)
             self._refresh_ai_visual_status()
@@ -1047,7 +1222,7 @@ class SettingsPage(QWidget):
             "cookies_file": self.cookies.text().strip(),
             "browser_cookie_source": self.browser_cookie.currentText(),
             "proxy": self.proxy.text().strip(),
-            "theme": self.theme_cb.currentText(),
+            "theme": self.theme_cb.currentData() or "dark",
             "clip_default_duration": int(self.clip_dur.value()),
             "clip_overlap": int(self.clip_overlap.value()),
             "clip_aspect": self.clip_aspect.currentText(),
@@ -1081,6 +1256,18 @@ class SettingsPage(QWidget):
             "cache_dir": self.storage_cache_dir.text().strip(),
             "temp_dir": self.storage_temp_dir.text().strip(),
             "ai_models_cache": getattr(self, "ai_models_cache", []),
+            "aut_max_concurrent": int(self.aut_max_concurrent.value()),
+            "aut_retry_limit": int(self.aut_retry_limit.value()),
+            "aut_acs_handoff": bool(self.aut_acs_handoff.isChecked()),
+            "aut_cca_handoff": bool(self.aut_cca_handoff.isChecked()),
+            "aut_autopilot_enabled": bool(self.aut_autopilot_enabled.isChecked()),
+            "aut_pack_whisper_model": self.aut_pack_model.currentText(),
+            "aut_publish_fallback": self.aut_fallback_map.get(self.aut_publish_fallback.currentText(), "ask"),
+            "aut_browser_headless": bool(self.aut_headless.isChecked()),
+            "aut_keep_diagnostics": bool(self.aut_keep_diag.isChecked()),
+            "aut_browser_minimize": bool(self.aut_minimize.isChecked()),
+            "aut_browser_channel": self.aut_channel_map.get(self.aut_browser_channel.currentText(), "msedge"),
+            "aut_tiktok_mode": self.aut_tiktok_map.get(self.aut_tiktok_mode.currentText(), "inbox"),
         })
         if not saved:
             QMessageBox.warning(self, "Penyimpanan gagal", "Pengaturan tidak tersimpan aman. Key API tidak ditulis ke settings.json.")

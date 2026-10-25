@@ -22,5 +22,14 @@ youtube-transcript-api>=1.0,<2
 python-dotenv>=1.0,<2
 requests>=2.31,<3
 
+# Automation — Browser Session / AI Browser Agent (opsional).
+# Paket Python ini ikut terpasang bersama requirements supaya mode Browser
+# Session bisa dipakai; Chopster tetap memakai Edge/Chrome yang sudah ada di
+# Windows (aut_browser_channel=msedge), jadi tidak ada unduhan ~280 MB.
+# Bila mesin tidak punya Edge/Chrome, pasang Chromium bawaan sekali:
+#   python -m playwright install chromium
+# Fitur Browser Session sendiri selalu default OFF (nyalakan per akun).
+playwright>=1.40
+
 # Build
 pyinstaller==6.22.3

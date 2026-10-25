@@ -20,6 +20,8 @@ from chopster.clipper.gemini_scene_vision import analyze_scene_visuals
 from chopster.clipper.transcript_manager import Transcript, load_cached_transcript, transcribe, save_cached_transcript
 from chopster.clipper.subtitle_ai import prepare_transcript_and_subtitles, transcript_prepare_signature
 from chopster.clipper.face_tracking import detect_face_focus
+from chopster.clipper.split_screen import SPLIT_MULTI_FOCUS, SPLIT_TWO_PERSON
+from chopster.clipper.split_screen import normalize_ai_windows
 from chopster.ai.provider_interface import AIRequest, AIResponse
 from chopster.clipper.visual_analyzer import extract_frame_images, select_visual_timestamps
 
@@ -337,26 +339,36 @@ def ensure_master_analysis(
     camera_artifact = load_artifact(project_dir, "camera", path)
     camera = None
     evidence: dict[str, Any] = {}
+    split_evidence: dict[str, Any] = {}
+    split_mode = str(mode) in (SPLIT_TWO_PERSON, SPLIT_MULTI_FOCUS)
     if isinstance(camera_artifact, dict) and isinstance(camera_artifact.get("points"), list):
         cached_aspect = float(camera_artifact.get("target_aspect") or 0)
         cached_mode = str(camera_artifact.get("mode") or "Smart")
-        if abs(cached_aspect - float(target_aspect or 9/16)) < 1e-4 and cached_mode == str(mode) and camera_artifact.get("camera_algorithm_version") == CAMERA_ALGORITHM_VERSION:
+        cached_split = camera_artifact.get("split") if isinstance(camera_artifact.get("split"), dict) else None
+        # A split-screen cache is only reusable when it actually carries the panel
+        # plan / reaction windows; otherwise the analysis is re-run.
+        split_ready = (not split_mode) or bool(cached_split and (cached_split.get("panel_plan") or cached_split.get("reaction_windows")))
+        if abs(cached_aspect - float(target_aspect or 9/16)) < 1e-4 and cached_mode == str(mode) and camera_artifact.get("camera_algorithm_version") == CAMERA_ALGORITHM_VERSION and split_ready:
             camera = camera_artifact.get("points")
+            split_evidence = dict(cached_split or {})
             evidence = {
                 "timeline": list(camera_artifact.get("timeline") or []),
                 "ai_shots": list(camera_artifact.get("ai_shots") or []),
                 "target_aspect": float(target_aspect or 9/16),
                 "sample_step": camera_artifact.get("sample_step"),
                 "target_samples": len(camera or []),
+                "split": split_evidence,
             }
     if camera is None or force_camera:
         if mode not in ("Manual", "Center"):
             emit(54, "Master Analysis — person/body/face tracking & camera locks…")
             try:
+                split_evidence = {}
                 focus_points = detect_face_focus(
                     path, 0.0, duration, 0.9, max_camera_samples,
                     mode=mode, transcript=tr, ai_config=ai_config, evidence_out=evidence,
                     progress_cb=lambda p,m: emit(54 + int(max(0,min(100,p))*0.16), f"Master Analysis — {m}"),
+                    split_out=split_evidence,
                 )
                 camera = [p.__dict__ for p in focus_points]
                 save_artifact(project_dir, "camera", {
@@ -366,6 +378,7 @@ def ensure_master_analysis(
                     "timeline": evidence.get("timeline") or [],
                     "ai_shots": evidence.get("ai_shots") or [],
                     "sample_step": evidence.get("sample_step"),
+                    "split": split_evidence,
                     "camera_algorithm_version": CAMERA_ALGORITHM_VERSION,
                 }, path)
             except Exception as exc:
@@ -373,12 +386,13 @@ def ensure_master_analysis(
                 emit(70, f"Camera analysis fallback — {str(exc)[:160]}")
         else:
             camera = []
+            split_evidence = {}
     else:
         emit(70, f"Camera cache ✓ — {len(camera)} focus points")
     if cancelled(): return {"cancelled": True}
 
     if not evidence:
-        evidence = {"timeline": [], "ai_shots": [], "target_aspect": float(target_aspect or 9/16), "sample_step": None, "target_samples": len(camera or [])}
+        evidence = {"timeline": [], "ai_shots": [], "target_aspect": float(target_aspect or 9/16), "sample_step": None, "target_samples": len(camera or []), "split": split_evidence}
 
     # Visual evidence pass: sampled frames are inspected by the same AI orchestrator.
     visual_review = None
@@ -433,9 +447,18 @@ def ensure_master_analysis(
                         "timeline": evidence.get("timeline") or [],
                         "ai_shots": ai_shots,
                         "sample_step": evidence.get("sample_step"),
+                        "split": split_evidence,
                         "camera_algorithm_version": CAMERA_ALGORITHM_VERSION,
                     }, path)
                     evidence["ai_shots"]=ai_shots
+                    # The multi-person mode reads its moments from the Camera
+                    # Director plan; when that plan arrives late, refresh the
+                    # reaction windows instead of keeping stale ones.
+                    if split_mode and split_evidence:
+                        late_windows = normalize_ai_windows(ai_shots, evidence.get("timeline") or [], start=0.0, end=duration)
+                        if late_windows:
+                            split_evidence["reaction_windows"] = late_windows
+                            split_evidence["source"] = str(late_windows[0].get("source") or "ai-camera-director")
             finally:
                 if root:
                     import shutil
@@ -476,6 +499,7 @@ def ensure_master_analysis(
         "scene_vision": scene_vision or {},
         "camera": camera or [],
         "camera_evidence": evidence.get("timeline") or [],
+        "split": split_evidence,
         "ai_shots": evidence.get("ai_shots") or [],
         "visual_review": visual_review or {},
         "ai_advice": ai_advice or {},
@@ -484,4 +508,4 @@ def ensure_master_analysis(
     }
     save_artifact(project_dir, "master", master, path)
     emit(100, "Master Analysis selesai — evidence + AI Editor Brain tersimpan")
-    return {"cancelled": False, "transcript": tr.to_dict(), "scenes": scenes or [], "scene_vision": scene_vision or {}, "focus": camera or [], "master": master}
+    return {"cancelled": False, "transcript": tr.to_dict(), "scenes": scenes or [], "scene_vision": scene_vision or {}, "focus": camera or [], "split": split_evidence, "master": master}

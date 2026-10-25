@@ -11,7 +11,7 @@ from pathlib import Path
 from copy import deepcopy
 
 from PySide6.QtCore import Qt, Signal, Slot, QUrl, QTimer, QEvent, QRect
-from PySide6.QtGui import QPixmap, QFont, QImage, QFontDatabase, QColor
+from PySide6.QtGui import QPixmap, QFont, QImage, QFontDatabase, QColor, QPainter
 from PySide6.QtWidgets import QGraphicsBlurEffect, QGraphicsDropShadowEffect, QGraphicsOpacityEffect
 from PySide6.QtMultimedia import QMediaPlayer, QAudioOutput, QVideoSink
 from PySide6.QtWidgets import (
@@ -42,10 +42,29 @@ from chopster.clipper.advanced_features import (
 from chopster.clipper.face_tracking import detect_face_focus
 from chopster.clipper.camera_director import interpolate_focus
 from chopster.clipper.adaptive_framing import decide_framing
+from chopster.clipper.split_screen import (
+    SPLIT_MULTI_FOCUS,
+    SPLIT_TWO_PERSON,
+    TRACKED_REFRAIM_MODES,
+    forced_panel_plan,
+    layout_panel_plan,
+    panel_crop_px,
+    panel_plan_for_range,
+    panels_at,
+    region_crop_window,
+    reaction_windows_for_range,
+)
 from chopster.clipper.scheduler import add_job, list_jobs, remove_job
 from chopster.clipper.analytics import record as record_analytics, summary as analytics_summary
 from chopster.clipper.master_analysis import ensure_master_analysis
 from chopster.clipper.voiceover import generate_voiceover
+
+
+# Reframe modes that consume the tracked camera timeline. The legacy list lives in
+# chopster.clipper.split_screen, so the "is this mode tracked?" check exists in
+# exactly one place; the two split-screen compositions are added on top of it.
+_TRACKED_MODES = tuple(TRACKED_REFRAIM_MODES) + (SPLIT_TWO_PERSON, SPLIT_MULTI_FOCUS)
+_SPLIT_MODES = (SPLIT_TWO_PERSON, SPLIT_MULTI_FOCUS)
 
 
 class ScrollSafeComboBox(QComboBox):
@@ -74,6 +93,32 @@ class ScrollSafeSlider(QSlider):
 
     def wheelEvent(self, event):
         event.ignore()
+
+
+class _DropWidget(QWidget):
+    """Scroll-area container that keeps drag-&-drop import working.
+
+    The page is wrapped in a QScrollArea so the transcript/bottom panes stay
+    reachable on short windows; QScrollArea's native viewport would swallow
+    file drops otherwise, so the inner widget forwards them to the page.
+    """
+
+    def __init__(self, host, parent=None):
+        super().__init__(parent)
+        self._host = host
+        self.setAcceptDrops(True)
+
+    def dragEnterEvent(self, event):
+        if self._host is not None:
+            self._host.dragEnterEvent(event)
+
+    def dragMoveEvent(self, event):
+        if self._host is not None:
+            self._host.dragEnterEvent(event)
+
+    def dropEvent(self, event):
+        if self._host is not None:
+            self._host.dropEvent(event)
 
 
 ACS_WORD_STYLES = {
@@ -117,11 +162,13 @@ class ClipperPage(QWidget):
         self.app=app; self.theme=theme; self.C=THEMES.get(theme,THEMES["dark"])
         self.setAcceptDrops(True)
         self.project=None; self.media=None; self.transcript=None; self.candidates=[]; self.clips=[]; self.focus_points=[]
+        # Split-screen evidence (camera timeline + panel plan / reaction windows).
+        self._camera_timeline=[]; self._ai_shots=[]; self._split_evidence={}
         self._project_generation=0; self._task_generations={}
         self._task_callbacks={}; self._task_errors={}; self._last_error=""; self._export_running=False
         self._subtitle_ready=False; self._subtitle_preview_time=None; self._preview_canvas_rect=None; self._fullscreen_preview=None; self._preview_muted=False; self._preview_volume=0.80
         self._acs_words_cache_owner=None; self._acs_words_cache=None
-        self._last_frame_image=None; self._last_frame_clock=0.0; self._preview_current_sec=0.0; self._pending_seek_sec=0.0; self._preview_quick_focus=[]; self._last_scene_preview_progress=-1.0; self._scene_segments=[]; self._scene_preview_mode=False
+        self._last_frame_image=None; self._last_frame_clock=0.0; self._preview_current_sec=0.0; self._pending_seek_sec=0.0; self._preview_quick_focus=[]; self._last_scene_preview_progress=-1.0; self._scene_segments=[]; self._scene_preview_mode=False; self._split_preview_windows=None
         self._build_ui()
         self.app.tasks.task_progress.connect(self._task_progress)
         self.app.tasks.task_result.connect(self._task_result)
@@ -130,7 +177,18 @@ class ClipperPage(QWidget):
 
     # ---------------------------------------------------------------- UI
     def _build_ui(self):
-        C=self.C; root=QVBoxLayout(self); root.setContentsMargins(16,14,16,14); root.setSpacing(10)
+        C=self.C
+        # Whole page scrolls when the window is shorter than the editor, so the
+        # transcript / bottom tabs are never pushed out of reach. _DropWidget
+        # keeps drag-&-drop import working inside the scroll container.
+        page_lay=QVBoxLayout(self); page_lay.setContentsMargins(0,0,0,0); page_lay.setSpacing(0)
+        scroll=QScrollArea(self); scroll.setWidgetResizable(True); scroll.setFrameShape(QFrame.NoFrame)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        inner=_DropWidget(self, scroll)
+        inner.setMinimumHeight(1020)
+        root=QVBoxLayout(inner); root.setContentsMargins(16,14,16,14); root.setSpacing(10)
+        page_lay.addWidget(scroll)
+        scroll.setWidget(inner)
         head=QHBoxLayout()
         title=QLabel("Content Clipper AI"); title.setObjectName("h1"); head.addWidget(title)
         self.project_label=QLabel("Belum ada project"); self.project_label.setObjectName("gold"); head.addWidget(self.project_label); head.addStretch()
@@ -153,13 +211,13 @@ class ClipperPage(QWidget):
         self.import_btn=QPushButton("🎬 Import Video"); self.import_btn.setObjectName("primary"); self.import_btn.clicked.connect(self._import_video); bar.addWidget(self.import_btn)
         self.download_btn=QPushButton("⬇ Download"); self.download_btn.setObjectName("ghost"); self.download_btn.clicked.connect(lambda:self.navigate.emit("download")); bar.addWidget(self.download_btn)
         self.aspect=ScrollSafeComboBox(); self.aspect.addItems(["Original","9:16","3:4","4:5","1:1","4:3","16:9"]); self.aspect.currentTextChanged.connect(self._on_aspect_changed); bar.addWidget(QLabel("Canvas / Frame")); bar.addWidget(self.aspect)
-        self.reframe=ScrollSafeComboBox(); self.reframe.addItems(["Smart","AI Camera Director","Speaker Focus","Two Person","Manual","Center"]); self.reframe.currentTextChanged.connect(self._on_reframe_changed); bar.addWidget(QLabel("Reframe")); bar.addWidget(self.reframe)
+        self.reframe=ScrollSafeComboBox(); self.reframe.addItems([*TRACKED_REFRAIM_MODES, SPLIT_TWO_PERSON, SPLIT_MULTI_FOCUS, "Manual", "Center"]); self.reframe.setToolTip("Two-Person Split Screen: dua orang, panel atas/bawah permanen. Multi-Person Smart Focus: side-by-side singkat saat momen reaksi, lalu kembali ke framing normal."); self.reframe.currentTextChanged.connect(self._on_reframe_changed); bar.addWidget(QLabel("Reframe")); bar.addWidget(self.reframe)
         self.quality=ScrollSafeComboBox(); self.quality.addItems(["fast","balanced","high"]); self.quality.setCurrentText(str(self.app.config.get("clip_quality") or "balanced")); bar.addWidget(QLabel("Quality")); bar.addWidget(self.quality)
         self.output_edit=QLineEdit(str(self.app.config.get("clip_output_dir") or "")); self.output_edit.setPlaceholderText("Folder export — kosong = folder Chopster_Exports"); bar.addWidget(self.output_edit,1)
         pick=QPushButton("Pilih Folder"); pick.setObjectName("ghost"); pick.clicked.connect(self._pick_output); bar.addWidget(pick)
         self._toolbar_layout=bar
         root.addLayout(bar)
-        self.aspect_help=self._hint("Canvas mengikuti rasio yang dipilih dan otomatis memakai Face/Person Safe Framing. 9:16 / 3:4 / 4:5 / 1:1 / 4:3 / 16:9 akan menyesuaikan posisi orang agar wajah tidak terpotong. Group yang terlalu lebar memakai komposisi fit.")
+        self.aspect_help=self._hint("Canvas mengikuti rasio yang dipilih dan otomatis memakai Face/Person Safe Framing. 9:16 / 3:4 / 4:5 / 1:1 / 4:3 / 16:9 akan menyesuaikan posisi orang agar wajah tidak terpotong. Group yang terlalu lebar memakai komposisi fit. Reframe \"Two-Person Split Screen\" = dua orang dalam panel atas/bawah permanen (crop close-up asli dipertahankan, tidak di-zoom ulang). \"Multi-Person Smart Focus (Reaction Split)\" = framing normal tetap jadi dasar, dan dua orang tampil side-by-side hanya selama momen reaksi terdeteksi, lalu kembali otomatis.")
         root.addWidget(self.aspect_help)
 
         self.progress=QProgressBar(); self.progress.setRange(0,100); self.progress.setValue(0); root.addWidget(self.progress)
@@ -761,6 +819,7 @@ class ClipperPage(QWidget):
         w=QWidget(); l=QVBoxLayout(w)
         l.addWidget(self._hint("AI Content Pack menghasilkan beberapa opsi judul, caption, deskripsi pendek + panjang seperti YouTube, hashtag, keyword SEO, pinned comment, dan teks thumbnail. Hasil tetap berbasis transcript/Viral Analyzer dan tidak boleh mengarang fakta."))
         row=QHBoxLayout(); self.caption_generate_btn=QPushButton("✨ Generate AI Content Pack"); self.caption_generate_btn.setObjectName("primary"); self.caption_generate_btn.clicked.connect(self._generate_captions); row.addWidget(self.caption_generate_btn)
+        self.caption_cancel_btn=QPushButton("⏹ Batalkan"); self.caption_cancel_btn.setObjectName("danger"); self.caption_cancel_btn.setEnabled(False); self.caption_cancel_btn.clicked.connect(self._cancel_captions); row.addWidget(self.caption_cancel_btn)
         self.caption_copy_btn=QPushButton("📋 Salin Semua"); self.caption_copy_btn.setObjectName("ghost"); self.caption_copy_btn.clicked.connect(self._copy_caption); row.addWidget(self.caption_copy_btn); row.addStretch(); l.addLayout(row)
         self.caption_status=self._hint("Belum ada content pack. Alur: Transcript → Viral Analyzer → Generate AI Content Pack."); l.addWidget(self.caption_status)
         self.caption_text=QTextEdit(); self.caption_text.setPlaceholderText("JUDUL OPSI\n\nDESKRIPSI PANJANG\n\nCAPTION\n\nHASHTAG\n\nKEYWORD SEO\n\nPINNED COMMENT\n\nTHUMBNAIL TEXT"); l.addWidget(self.caption_text)
@@ -769,6 +828,15 @@ class ClipperPage(QWidget):
     def _build_publish_tab(self):
         w=QWidget(); l=QVBoxLayout(w); form=QFormLayout(); self.pub_platform=ScrollSafeComboBox(); self.pub_platform.addItems(["YouTube Shorts","TikTok","Instagram Reels","YouTube"]); form.addRow("Platform",self.pub_platform); self.pub_title=QLineEdit(); form.addRow("Title",self.pub_title); self.pub_schedule=QLineEdit(); self.pub_schedule.setPlaceholderText("YYYY-MM-DD HH:MM (opsional)"); form.addRow("Schedule",self.pub_schedule); l.addLayout(form)
         l.addWidget(self._hint("Publish Queue saat ini adalah staging/scheduling lokal: menyimpan file + platform + caption + waktu. Ini BELUM mengunggah otomatis ke TikTok/Instagram/YouTube karena kredensial/API platform belum terhubung. Jadi Schedule = metadata jadwal, bukan jaminan auto-publish."))
+        auto_row=QHBoxLayout()
+        auto_hint=QLabel("🤖 Untuk auto-publish sungguhan: setiap clip yang berhasil export otomatis terdaftar di tab Automation sebagai media siap publish (bisa dimatikan di Settings → Automation).")
+        auto_hint.setWordWrap(True)
+        auto_row.addWidget(auto_hint,1)
+        auto_btn=QPushButton("Buka Automation")
+        auto_btn.setObjectName("ghost")
+        auto_btn.clicked.connect(lambda: self.navigate.emit("automation"))
+        auto_row.addWidget(auto_btn)
+        l.addLayout(auto_row)
         b=QPushButton("＋ Tambah ke Publish Queue"); b.setObjectName("primary"); b.clicked.connect(self._schedule_publish); l.addWidget(b); self.publish_list=QListWidget(); l.addWidget(self.publish_list); r=QPushButton("↻ Refresh Queue"); r.clicked.connect(self._refresh_publish); l.addWidget(r); self.bottom.addTab(w,"📤 Publish")
         self._refresh_publish()
 
@@ -797,7 +865,7 @@ class ClipperPage(QWidget):
             self.project=create_project(Path(path).stem,path,{"duration":meta.duration,"width":meta.width,"height":meta.height,"fps":meta.fps,"has_audio":meta.has_audio})
             # A fresh import starts a fresh editing state. Never leak transcript,
             # highlights, scenes or subtitles from the previously opened video.
-            self.transcript=None; self.candidates=[]; self.clips=[]; self.focus_points=[]; self._scene_segments=[]; self._scene_preview_mode=False; self._preview_quick_focus=[]; self._subtitle_ready=False; self._subtitle_preview_time=None
+            self.transcript=None; self.candidates=[]; self.clips=[]; self.focus_points=[]; self._scene_segments=[]; self._scene_preview_mode=False; self._preview_quick_focus=[]; self._subtitle_ready=False; self._subtitle_preview_time=None; self._last_frame_image=None; self._camera_timeline=[]; self._ai_shots=[]; self._split_evidence={}; self._split_preview_windows=None
             if hasattr(self,"transcript_table"): self.transcript_table.setRowCount(0)
             if hasattr(self,"clip_table"): self.clip_table.setRowCount(0)
             if hasattr(self,"highlight_list"): self.highlight_list.clear()
@@ -825,6 +893,7 @@ class ClipperPage(QWidget):
         except Exception:
             pass
         self.project=None; self.media=None; self.transcript=None; self.candidates=[]; self.clips=[]; self.focus_points=[]; self._scene_segments=[]; self._scene_preview_mode=False; self._preview_quick_focus=[]; self._subtitle_ready=False; self._subtitle_preview_time=None; self._last_frame_image=None
+        self._camera_timeline=[]; self._ai_shots=[]; self._split_evidence={}; self._split_preview_windows=None
         self.video.clear(); self.video.setText("Import video lalu klik Play untuk melihat preview.")
         self.transcript_table.setRowCount(0); self.clip_table.setRowCount(0); self.highlight_list.clear(); self.subtitle_overlay.hide(); self.watermark_overlay.hide(); self.project_label.setText("Belum ada project"); self.status.setText("Project baru — import video.")
 
@@ -841,6 +910,12 @@ class ClipperPage(QWidget):
         self._project_generation+=1; self.project=p
         self._set_source_without_project(p.source_path)
         extra=p.extra or {}; self.clips=list(extra.get("clips",[])); self.focus_points=list(extra.get("focus_points",[])); self._scene_segments=list(extra.get("scene_segments",[]) or []); self._scene_preview_mode=bool(self._scene_segments); self.candidates=list(extra.get("candidates",[]))
+        try:
+            camera_artifact=load_artifact(self.project_dir(),"camera",p.source_path)
+            if isinstance(camera_artifact,dict):
+                self._remember_split_evidence(camera_artifact, camera_artifact.get("split"))
+        except Exception:
+            self._camera_timeline=[]; self._ai_shots=[]; self._split_evidence={}; self._split_preview_windows=None
         settings=extra.get("settings") or {}
         try:
             if settings.get("aspect") in [self.aspect.itemText(i) for i in range(self.aspect.count())]: self.aspect.setCurrentText(settings["aspect"])
@@ -945,6 +1020,8 @@ class ClipperPage(QWidget):
             self.transcribe_btn.setEnabled(False); self.transcribe_cancel_btn.setEnabled(True)
         if tid=="clipper:analyze" and hasattr(self,"analyze_btn"): self.analyze_btn.setEnabled(False)
         if tid=="clipper:scene" and hasattr(self,"scene_btn"): self.scene_btn.setEnabled(False)
+        if tid=="clipper:captions" and hasattr(self,"caption_cancel_btn"):
+            self.caption_generate_btn.setEnabled(False); self.caption_cancel_btn.setEnabled(True)
         return True
     def _task_progress(self,tid,pct,msg):
         if self._task_generations.get(tid) != self._project_generation:return
@@ -973,6 +1050,8 @@ class ClipperPage(QWidget):
             self.transcribe_btn.setEnabled(True); self.transcribe_cancel_btn.setEnabled(False)
         if tid=="clipper:scene" and hasattr(self,"scene_btn"): self.scene_btn.setEnabled(True)
         if tid=="clipper:analyze" and hasattr(self,"analyze_btn"): self.analyze_btn.setEnabled(True)
+        if tid=="clipper:captions" and hasattr(self,"caption_cancel_btn"):
+            self.caption_generate_btn.setEnabled(True); self.caption_cancel_btn.setEnabled(False)
         if tid=="clipper:export": self.export_btn.setEnabled(True)
         if not current:return
         if cb:
@@ -986,11 +1065,16 @@ class ClipperPage(QWidget):
             self.transcribe_btn.setEnabled(True); self.transcribe_cancel_btn.setEnabled(False)
         if tid=="clipper:scene" and hasattr(self,"scene_btn"): self.scene_btn.setEnabled(True)
         if tid=="clipper:analyze" and hasattr(self,"analyze_btn"): self.analyze_btn.setEnabled(True)
+        if tid=="clipper:captions" and hasattr(self,"caption_cancel_btn"):
+            self.caption_generate_btn.setEnabled(True); self.caption_cancel_btn.setEnabled(False)
         cb=self._task_errors.pop(tid,None)
         self._task_callbacks.pop(tid,None)
         if tid=="clipper:export": self.export_btn.setEnabled(True)
         if not current:return
-        self._last_error=error; self.stat_status.set_value("Gagal"); self.status.setText(f"Gagal: {error[:160]}"); self._log(f"ERROR: {error}")
+        cancelled = str(error) == "Dibatalkan"
+        self._last_error=error; self.stat_status.set_value("Gagal")
+        self.status.setText("Dibatalkan." if cancelled else f"Gagal: {error[:160]}")
+        self._log("Dibatalkan" if cancelled else f"ERROR: {error}")
     def _cancel_tasks(self): self.app.tasks.cancel_all("clipper:"); self.status.setText("Membatalkan...")
 
     # -------------------------------------------------------------- transcript
@@ -1107,8 +1191,8 @@ class ClipperPage(QWidget):
         if self.app.tasks.is_active("clipper:master"):
             self.status.setText("Master Analysis masih berjalan."); return
         path=self.project.source_path; model=self.model.currentText(); lang=self.lang.currentText(); wt=self.word_ts.isChecked(); duration=float(self.media.duration)
-        mode=self.reframe.currentText() if self.reframe.currentText() in ("Smart","AI Camera Director","Speaker Focus","Two Person") else "Smart"
-        cfg=self._ai_config(); cfg["ai_camera_director"] = mode in ("Smart","AI Camera Director","Speaker Focus","Two Person"); cfg["target_aspect"] = self._preview_target_ratio()
+        mode=self._reframe_mode()
+        cfg=self._ai_config(); cfg["ai_camera_director"] = self._needs_ai_director(mode); cfg["target_aspect"] = self._preview_target_ratio()
         project_path=self.project_dir(); target_aspect=cfg["target_aspect"]; device=str(self.app.config.get("transcribe_device") or "auto")
         def worker(*,signals,cancel_check):
             return ensure_master_analysis(project_path,path,model=model,language=lang,word_timestamps=wt,device=device,mode=mode,ai_config=cfg,progress_cb=lambda p,m: signals.progress.emit("clipper:master",p,m),cancel_check=cancel_check,force_camera=False,max_camera_samples=1800,target_aspect=target_aspect)
@@ -1119,7 +1203,10 @@ class ClipperPage(QWidget):
             master_obj = res.get("master") if isinstance(res.get("master"), dict) else {}
             adv = master_obj.get("ai_advice", {}) if isinstance(master_obj, dict) else {}
             vis = master_obj.get("visual_review", {}) if isinstance(master_obj, dict) else {}
-            self.status.setText(f"Master Analysis selesai — transcript {len(self.transcript.segments)} • {len(res.get('scenes',[]))} scene • camera {len(self.focus_points)} point • AI Text: {adv.get('source','local')} • AI Vision: {vis.get('source','local')}. Semua fitur downstream membaca cache ini.")
+            self._remember_split_evidence(master_obj, res.get("split"))
+            split_hint=self._split_status_text() if self.reframe.currentText() in _SPLIT_MODES else ""
+            self._render_preview_frame()
+            self.status.setText(f"Master Analysis selesai — transcript {len(self.transcript.segments)} • {len(res.get('scenes',[]))} scene • camera {len(self.focus_points)} point • AI Text: {adv.get('source','local')} • AI Vision: {vis.get('source','local')}. Semua fitur downstream membaca cache ini." + (f" {split_hint}" if split_hint else ""))
         self._submit("clipper:master","Master Analysis",worker,done)
 
     def _render_transcript(self):
@@ -1571,21 +1658,35 @@ class ClipperPage(QWidget):
     def _detect_faces(self):
         if not self.project or not self.media:
             QMessageBox.information(self,"Smart Reframe","Import video terlebih dahulu."); return
-        mode=self.reframe.currentText() if self.reframe.currentText() in ("Smart","AI Camera Director","Speaker Focus","Two Person") else "Smart"
-        cfg=self._ai_config(); cfg["ai_camera_director"] = mode in ("Smart","AI Camera Director","Speaker Focus","Two Person"); cfg["target_aspect"] = self._preview_target_ratio()
+        mode=self._reframe_mode()
+        cfg=self._ai_config(); cfg["ai_camera_director"] = self._needs_ai_director(mode); cfg["target_aspect"] = self._preview_target_ratio()
         self.status.setText("Detecting people/faces — camera locks stable subjects and uses AI only for editorial shot decisions.")
         path=self.project.source_path; project_path=self.project_dir(); duration=float(self.media.duration)
         transcript=deepcopy(self.transcript); target_aspect=cfg["target_aspect"]
         def worker(*,signals,cancel_check):
+            split_evidence={}
+            camera_evidence={}
             def run():
-                return detect_face_focus(path,0,duration,0.9,1800,mode,transcript,cfg)
+                return detect_face_focus(path,0,duration,0.9,1800,mode,transcript,cfg,
+                                         evidence_out=camera_evidence,split_out=split_evidence)
             pts=run()
-            return [p.__dict__ for p in pts]
-        def done(pts):
+            artifact={"points":[p.__dict__ for p in pts],"target_aspect":target_aspect,"mode":mode,
+                      "timeline":list(camera_evidence.get("timeline") or []),
+                      "ai_shots":list(camera_evidence.get("ai_shots") or []),
+                      "sample_step":camera_evidence.get("sample_step"),
+                      "split":split_evidence,"camera_algorithm_version":"8.5.0"}
+            return artifact
+        def done(res):
+            artifact=res if isinstance(res,dict) else {}
+            pts=list(artifact.get("points") or [])
+            split_evidence=dict(artifact.get("split") or {})
             self.focus_points=pts; self._preview_quick_focus=[]
-            try: save_artifact(project_path,"camera",{"points":pts,"target_aspect":target_aspect,"mode":mode,"camera_algorithm_version":"8.5.0"},path)
+            try: save_artifact(project_path,"camera",artifact,path)
             except Exception: pass
-            self._save_project(); self._render_preview_frame(); self.status.setText(f"Face / Person Tracking selesai: {len(pts)} locked camera points. Semua aspect ratio sekarang memakai metadata subject-safe.")
+            self._remember_split_evidence(artifact, split_evidence)
+            self._save_project(); self._render_preview_frame()
+            hint=self._split_status_text() if mode in _SPLIT_MODES else ""
+            self.status.setText(f"Face / Person Tracking selesai: {len(pts)} locked camera points. Semua aspect ratio sekarang memakai metadata subject-safe." + (f" {hint}" if hint else ""))
         self._submit("clipper:faces","Person + Face Tracking",worker,done)
 
     # -------------------------------------------------------------- captions/AI extras
@@ -1657,6 +1758,10 @@ class ClipperPage(QWidget):
             self._save_project()
         self._submit("clipper:captions","AI Content Pack",worker,done)
 
+    def _cancel_captions(self):
+        self.app.tasks.cancel("clipper:captions")
+        self.caption_status.setText("Membatalkan AI Content Pack…")
+
     def _copy_caption(self):
         try:
             from PySide6.QtWidgets import QApplication
@@ -1727,6 +1832,271 @@ class ClipperPage(QWidget):
         title=str(d.get("title") or f"Viral Highlight {start:.0f}s")
         row={"index":1,"start":start,"end":end,"title":title,"status":"planned","output":"","selected":True}
         self._export(False, forced_rows=[row], dialog_title="Export Viral Highlight")
+    # ------------------------------------------- split screen (two new modes)
+    def _reframe_mode(self):
+        value=self.reframe.currentText()
+        return value if value in _TRACKED_MODES else "Smart"
+
+    def _needs_ai_director(self, mode):
+        """The permanent split is deterministic; the reaction split follows the AI plan."""
+        return mode in _TRACKED_MODES and mode != SPLIT_TWO_PERSON
+
+    def _remember_split_evidence(self, source=None, split=None):
+        """Keep the newest camera timeline + split plan for export and LIVE PREVIEW."""
+        payload=dict(split) if isinstance(split,dict) else {}
+        data=source if isinstance(source,dict) else {}
+        if not payload and isinstance(data.get("split"),dict):
+            payload=dict(data.get("split") or {})
+        timeline=data.get("camera_evidence") or data.get("timeline") or []
+        if timeline:
+            self._camera_timeline=list(timeline)
+        shots=data.get("ai_shots") or []
+        if shots:
+            self._ai_shots=list(shots)
+        if payload:
+            self._split_evidence=payload
+        self._split_preview_windows=None
+
+    def _split_status_text(self):
+        mode=self.reframe.currentText(); info=self._split_evidence if isinstance(self._split_evidence,dict) else {}
+        if mode==SPLIT_TWO_PERSON:
+            usable=len([p for p in (info.get("panel_plan") or []) if p])
+            if usable>=2:
+                source=str(info.get("source") or "")
+                if source=="side-by-side layout":
+                    asal="dua feed kiri/kanan sumber"
+                elif source=="automatic split":
+                    asal=("orang belum terdeteksi — panel dibagi otomatis kiri/kanan"
+                          if not info.get("tracked_people") else "1 orang terlacak + separuh frame lainnya")
+                else:
+                    asal="2 orang terlacak"
+                return f"Two-Person Split Screen aktif — {usable} panel atas/bawah ({asal})."
+            return ("Two-Person Split Screen aktif — panel atas/bawah dibuat otomatis saat export/preview "
+                    "(pembagian kiri/kanan), jadi clip tetap split walau belum ada tracking.")
+        if mode==SPLIT_MULTI_FOCUS:
+            windows=info.get("reaction_windows") or []
+            if windows:
+                return f"Multi-Person Smart Focus — {len(windows)} momen reaksi (sumber: {info.get('source') or 'analisis lokal'}); framing normal tetap dipakai di luar momen itu."
+            return "Multi-Person Smart Focus — belum ada momen reaksi dua orang; clip memakai framing normal."
+        return ""
+
+    def _apply_split_plan(self, rows, split_mode):
+        """Attach the per-clip split composition. Legacy framing modes are untouched."""
+        if not split_mode:
+            return 0
+        # Canvas "Original" is not a blocker: the renderer stacks the panels on
+        # its 9:16 canvas for that case (clip_renderer.export_clip), so an
+        # explicitly selected split mode still produces a real split.
+        timeline=self._camera_timeline
+        layout_ready=bool(self._layout_info())
+        if not timeline and not layout_ready and split_mode!=SPLIT_TWO_PERSON:
+            self.status.setText(f"{split_mode}: timeline orang belum tersedia — jalankan Master Analysis atau Smart Reframe dulu. Export memakai framing biasa.")
+            return 0
+        planned=0
+        for row in rows:
+            try:
+                start=float(row.get("start",0.0)); end=float(row.get("end",start))
+            except (TypeError,ValueError):
+                continue
+            if split_mode==SPLIT_TWO_PERSON:
+                panels=panel_plan_for_range(timeline,start=start,end=end)
+                if len([p for p in panels if p])<2:
+                    # Two-feed source (OmeTV/Omegle): the analysis already knows
+                    # each feed, so the permanent layout still renders even when
+                    # the tracker saw fewer than two people in this clip.
+                    fallback=self._layout_panels_for_range(start,end)
+                    if len([p for p in fallback if p])>=2:
+                        panels=fallback
+                if len([p for p in panels if p])<2:
+                    # Hard guarantee: while this mode is selected every clip gets
+                    # its two panels, whatever the detection found. The frame
+                    # halves are always a valid pair (left on top, right below),
+                    # so the export can never silently fall back to normal framing.
+                    panels=self._forced_panels_for_range(start,end)
+                if len([p for p in panels if p])>=2:
+                    row["composition"]="split_v"; row["panel_plan"]=panels; planned+=1
+            else:
+                windows=reaction_windows_for_range(timeline,start=start,end=end,shots=self._ai_shots)
+                if windows:
+                    row["reaction_windows"]=windows; planned+=1
+        return planned
+
+    def _layout_info(self):
+        """Two-feed composition of the current analysis (empty when absent)."""
+        info=self._split_evidence if isinstance(self._split_evidence,dict) else {}
+        layout=info.get("layout")
+        return dict(layout) if isinstance(layout,dict) else {}
+
+    def _layout_panels_for_range(self, start, end):
+        """Feed panels of the analysed two-feed source, re-timed for one clip.
+
+        ``export_clip`` seeks with ``-ss`` before the input, so the panel samples
+        must be clip-relative; the analysed panels are reused as they are (the
+        composition is static) except for those sample times.
+        """
+        layout=self._layout_info()
+        if not layout:
+            return []
+        info=self._split_evidence if isinstance(self._split_evidence,dict) else {}
+        analysed=[p for p in (info.get("panel_plan") or [])
+                  if isinstance(p,dict) and isinstance(p.get("region"),dict)]
+        span=max(0.02,float(end)-float(start))
+        if len(analysed)>=2:
+            out=[]
+            for panel in analysed[:2]:
+                q=dict(panel)
+                box=q.get("box") if isinstance(q.get("box"),dict) else {}
+                sample={"cx":float(q.get("cx",0.5)),"cy":float(q.get("cy",0.5)),
+                        "left":float(box.get("left",0.0)),"right":float(box.get("right",1.0)),
+                        "top":float(box.get("top",0.0)),"bottom":float(box.get("bottom",1.0))}
+                q["samples"]=[dict(sample,t=0.0),dict(sample,t=round(span,3))]
+                out.append(q)
+            return out
+        try:
+            return layout_panel_plan(layout.get("split_x",0.5),start=0.0,end=span)
+        except Exception:
+            return []
+
+    def _subjects_for_range(self, start, end):
+        """Face boxes (normalised) seen inside one clip range, for panel aiming."""
+        out=[]
+        for row in (self._camera_timeline or []):
+            if not isinstance(row,dict):
+                continue
+            try:
+                t=float(row.get("t",0.0) or 0.0)
+            except (TypeError,ValueError):
+                continue
+            if t<float(start)-0.001 or t>float(end)+0.001:
+                continue
+            for face in (row.get("faces") or []):
+                if not isinstance(face,dict):
+                    continue
+                box={k:face.get(k) for k in ("left","right","top","bottom")}
+                if all(isinstance(v,(int,float)) for v in box.values()):
+                    out.append(box)
+        return out
+
+    def _forced_panels_for_range(self, start, end):
+        """Two panels that always exist for one clip (the hard split guarantee).
+
+        Used when neither the tracked pair nor the analysed two feeds produced
+        two panels: the frame halves become the pair (left on top, right below),
+        re-timed for this clip because ``export_clip`` seeks with ``-ss``.
+        """
+        layout=self._layout_info()
+        split_x=layout.get("split_x") if layout else None
+        span=max(0.02,float(end)-float(start))
+        try:
+            panels=forced_panel_plan(start=0.0,end=span,split_x=split_x,
+                                     subjects=self._subjects_for_range(start,end))
+        except Exception as exc:
+            self._log(f"Panel split otomatis gagal: {exc}")
+            return []
+        return [p for p in panels if p]
+
+    def _split_preview_windows(self):
+        if self._split_preview_windows is None:
+            windows=[]
+            try:
+                if self._camera_timeline:
+                    end=float(getattr(self.media,"duration",0.0) or 0.0)
+                    windows=reaction_windows_for_range(self._camera_timeline,start=0.0,end=max(10.0,end),shots=self._ai_shots)
+            except Exception:
+                windows=[]
+            self._split_preview_windows=windows
+        return list(self._split_preview_windows or [])
+
+    @staticmethod
+    def _panel_sample_at(panel, sec):
+        samples=[s for s in (panel.get("samples") or []) if isinstance(s,dict)]
+        if not samples:
+            return None
+        near=min(samples,key=lambda s: abs(float(s.get("t",0.0) or 0.0)-float(sec)))
+        q=dict(panel)
+        q["cx"]=float(near.get("cx",panel.get("cx",0.5))); q["cy"]=float(near.get("cy",panel.get("cy",0.5)))
+        q["box"]={"left":float(near.get("left",0.35)),"right":float(near.get("right",0.65)),
+                  "top":float(near.get("top",0.15)),"bottom":float(near.get("bottom",0.75))}
+        return q
+
+    @staticmethod
+    def _panel_crop_image(image, panel, aspect):
+        """Crop one panel with the exact geometry the renderer uses."""
+        if image is None or image.isNull() or not panel:
+            return None
+        sw,sh=image.width(),image.height()
+        window=region_crop_window(panel,sw,sh,max(0.05,float(aspect)))
+        if window:
+            cw=max(2,min(sw,int(window.get("w",2)))); ch=max(2,min(sh,int(window.get("h",2))))
+            left=max(0,min(sw-cw,int(window.get("x",0)))); top=max(0,min(sh-ch,int(window.get("y",0))))
+            return image.copy(left,top,cw,ch)
+        cw,ch=panel_crop_px(panel,sw,sh,max(0.05,float(aspect)))
+        cw=max(2,min(sw,int(cw))); ch=max(2,min(sh,int(ch)))
+        cx=float(panel.get("cx",0.5))*sw; cy=float(panel.get("cy",0.5))*sh
+        left=int(round(cx-cw/2.0)); top=int(round(cy-ch/2.0))
+        left=max(0,min(sw-cw,left)); top=max(0,min(sh-ch,top))
+        return image.copy(left,top,cw,ch)
+
+    @staticmethod
+    def _split_canvas(crops, w, h, vertical=True):
+        """Compose panels with scale-to-fill + centre crop, exactly like the FFmpeg graph."""
+        w=max(2,int(w)); h=max(2,int(h))
+        canvas=QImage(w,h,QImage.Format_RGB32); canvas.fill(QColor("black"))
+        painter=QPainter(canvas)
+        try:
+            if vertical:
+                cells=[QRect(0,0,w,h//2),QRect(0,h//2,w,h-h//2)]
+            else:
+                cells=[QRect(0,0,w//2,h),QRect(w//2,0,w-w//2,h)]
+            for crop,cell in zip(crops,cells):
+                if crop is None or crop.isNull() or cell.width()<2 or cell.height()<2:
+                    continue
+                scaled=crop.scaled(max(2,cell.width()),max(2,cell.height()),Qt.KeepAspectRatioByExpanding,Qt.SmoothTransformation)
+                if scaled.width()>cell.width() or scaled.height()>cell.height():
+                    scaled=scaled.copy(max(0,(scaled.width()-cell.width())//2),max(0,(scaled.height()-cell.height())//2),
+                                       min(cell.width(),scaled.width()),min(cell.height(),scaled.height()))
+                painter.drawImage(cell.x()+(cell.width()-scaled.width())//2,cell.y()+(cell.height()-scaled.height())//2,scaled)
+        finally:
+            painter.end()
+        return canvas
+
+    def _render_split_preview(self, w, h):
+        """True when the split composition painted the preview for this frame."""
+        image=self._last_frame_image; mode=self.reframe.currentText(); sec=float(self._preview_current_sec or 0.0)
+        if image is None or image.isNull():
+            return False
+        if mode==SPLIT_TWO_PERSON:
+            panels=panels_at(self._camera_timeline,sec) if self._camera_timeline else []
+            if len([p for p in panels if p])<2:
+                # Two-feed source: the analysed feed panels are static, so they
+                # are shown whatever moment the preview is parked on.
+                panels=self._layout_panels_for_range(0.0,max(1.0,sec)) or panels
+            if len([p for p in panels if p])<2:
+                # Hard guarantee: the LIVE PREVIEW shows what the export renders,
+                # so the frame halves are used when nothing was detected at all.
+                panels=self._forced_panels_for_range(0.0,max(1.0,sec)) or panels
+            if len([p for p in panels if p])<1:
+                return False
+            while len(panels)<2:
+                panels.append(None)
+            crops=[self._panel_crop_image(image,p,w/max(1.0,h/2.0)) for p in panels[:2]]
+            canvas=self._split_canvas(crops,w,h,vertical=True)
+        elif mode==SPLIT_MULTI_FOCUS:
+            if not self._camera_timeline:
+                return False
+            active=next((x for x in self._split_preview_windows() if float(x.get("start",0.0))<=sec<=float(x.get("end",0.0))),None)
+            if not active:
+                return False
+            crops=[self._panel_crop_image(image,self._panel_sample_at(active.get(key) or {},sec),(w/2.0)/max(1.0,float(h)))
+                   for key in ("panel_left","panel_right")]
+            canvas=self._split_canvas(crops,w,h,vertical=False)
+        else:
+            return False
+        self.preview_bg.clear(); self.preview_bg.hide()
+        pix=QPixmap.fromImage(canvas).scaled(max(1,w-4),max(1,h-4),Qt.IgnoreAspectRatio,Qt.SmoothTransformation)
+        self.video.setPixmap(pix); self.video.setText(""); self.video.setStyleSheet("")
+        return True
+
     def _export(self,all_items,forced_rows=None,dialog_title="Export"):
         if not self.project or (not self.clips and forced_rows is None):
             QMessageBox.information(self,"Export","Belum ada clip. Pilih mode clip lalu klik Generate Clips.")
@@ -1751,6 +2121,15 @@ class ClipperPage(QWidget):
         wm_img=self.wm_image.text().strip() if self.wm_enable.isChecked() and self.wm_type.currentText()=="Image" else None
         # convert focus plan to clip-relative coordinates
         fp=deepcopy(focus); chosen=deepcopy(chosen)
+        split_mode=self.reframe.currentText() if self.reframe.currentText() in _SPLIT_MODES else ""
+        if split_mode:
+            planned=self._apply_split_plan(chosen, split_mode)
+            if planned:
+                self.status.setText(f"{split_mode}: komposisi split direncanakan untuk {planned}/{len(chosen)} clip (panel/timing mengikuti isi tiap clip).")
+                if split_mode==SPLIT_TWO_PERSON and self.aspect.currentText()=="Original":
+                    self._log("Canvas Original + Two-Person Split Screen: panel dirender pada canvas 9:16 (1080x1920), sama seperti LIVE PREVIEW.")
+            else:
+                self._log(f"{split_mode}: tidak ada clip yang memakai komposisi split — framing normal dipakai untuk semua clip.")
         path=self.project.source_path; quality=self.quality.currentText(); aspect=self.aspect.currentText().lower()
         parallel=int(self.app.config.get("export_parallel") or 1)
         watermark_position=self.wm_pos.currentText(); watermark_opacity=self.wm_op.value()
@@ -1766,7 +2145,7 @@ class ClipperPage(QWidget):
                 signals.progress.emit("clipper:export",pct,f"Clip {idx}: {state}" if int(idx)>0 else state)
                 if "Gagal:" in state:
                     errors.append(f"Clip {idx} ({title}): {state}")
-            ok,fail=export_batch(path,chosen,out,quality,aspect,cancel_flag=cancel_check,on_progress=prog,on_clip=clip_cb,parallel=parallel,burn_subtitle=burn,watermark_text=wm_text,watermark_image=wm_img,watermark_position=watermark_position,watermark_opacity=watermark_opacity,watermark_font_size=watermark_font_size,watermark_scale=watermark_scale,focus_points=fp,audio_filter=audio_filter)
+            ok,fail=export_batch(path,chosen,out,quality,aspect,cancel_flag=cancel_check,on_progress=prog,on_clip=clip_cb,parallel=parallel,burn_subtitle=burn,watermark_text=wm_text,watermark_image=wm_img,watermark_position=watermark_position,watermark_opacity=watermark_opacity,watermark_font_size=watermark_font_size,watermark_scale=watermark_scale,focus_points=fp,audio_filter=audio_filter,transcript=self.transcript)
             return ok,fail,str(out),list(errors)
         def done(res):
             ok,fail,folder,errs=res
@@ -1783,6 +2162,8 @@ class ClipperPage(QWidget):
                         c["status"]="failed"
             self._render_clips(); self._save_project(); self.status.setText(f"Export selesai — {ok} berhasil, {fail} gagal"); self.stat_status.set_value("Selesai")
             detail=("\n\n"+"\n".join(errs[:5])) if errs else ""
+            if ok:
+                detail+="\n\n🤖 "+str(ok)+" clip otomatis terdaftar di tab Automation (Ready Media) untuk dijadwalkan/upload."
             if fail:
                 self._log("EXPORT ERROR: "+" | ".join(errs[:10]))
             QMessageBox.information(self,dialog_title,f"Selesai.\nBerhasil: {ok}\nGagal: {fail}\nFolder: {folder}{detail}")
@@ -1853,9 +2234,11 @@ class ClipperPage(QWidget):
             except Exception:pass
         self._refresh_preview_canvas(); self._render_preview_frame(); self._refresh_preview_overlay(); self._save_preview_settings(); self.status.setText(f"Canvas {value} diterapkan — subject-safe framing {'aktif' if self.focus_points or self._preview_quick_focus else 'center fallback'}.")
     def _on_reframe_changed(self, value):
-        if value in ("Smart","AI Camera Director","Speaker Focus","Two Person") and not self.focus_points:
+        if value in _TRACKED_MODES and not self.focus_points:
             self._update_preview_quick_focus()
-        self._refresh_preview_canvas(); self._render_preview_frame(); self.status.setText(f"Reframe {value} diterapkan ke LIVE PREVIEW.")
+        self._refresh_preview_canvas(); self._render_preview_frame()
+        hint=self._split_status_text() if value in _SPLIT_MODES else ""
+        self.status.setText(f"Reframe {value} diterapkan ke LIVE PREVIEW." + (f" {hint}" if hint else ""))
     def _save_preview_settings(self):
         try:self.app.config.set("clip_aspect",self.aspect.currentText()); self.app.config.set("reframe_mode",self.reframe.currentText())
         except Exception:pass
@@ -2094,7 +2477,7 @@ class ClipperPage(QWidget):
             self._preview_quick_focus=[]
 
     def _preview_focus_point(self, sec: float):
-        if self.reframe.currentText() not in ("Smart","AI Camera Director","Speaker Focus","Two Person"):
+        if self.reframe.currentText() not in _TRACKED_MODES:
             return None
         try:
             from chopster.clipper.camera_director import normalize_points
@@ -2180,6 +2563,17 @@ class ClipperPage(QWidget):
         try:
             x,y,w,h=self._canvas_rect(); self._preview_canvas_rect=(x,y,w,h); self.preview_canvas.setGeometry(x,y,w,h)
             self.preview_bg.setGeometry(0,0,w,h); self.video.setGeometry(0,0,w,h)
+            # The two split-screen modes preview their own composition. When the
+            # plan is not available yet the normal single-panel preview below is
+            # used instead, so the editor never shows an empty canvas.
+            # Canvas "Original" is previewed as well: the exporter stacks the
+            # panels on its 9:16 canvas for that case, so the preview matches it.
+            if self.reframe.currentText() in _SPLIT_MODES:
+                try:
+                    if self._render_split_preview(w,h):
+                        self._position_preview_overlays(); self._sync_fullscreen_preview(); return
+                except Exception as exc:
+                    self._log(f"Split preview fallback: {exc}")
             p=self._preview_focus_point(self._preview_current_sec)
             adaptive=False
             if p is not None and self.aspect.currentText() != "Original":
@@ -2404,8 +2798,8 @@ class ClipperPage(QWidget):
         model=self.model.currentText(); lang=self.lang.currentText(); wt=self.word_ts.isChecked()
         total_duration=float(self.media.duration)
         config=self._ai_config(); count=self.clip_count.value(); publish_platform=str(self.app.config.get("publish_platform") or "YouTube Shorts")
-        analysis_mode=self.reframe.currentText() if self.reframe.currentText() in ("Smart","AI Camera Director","Speaker Focus","Two Person") else "Smart"
-        config["ai_camera_director"] = analysis_mode in ("Smart","AI Camera Director","Speaker Focus","Two Person")
+        analysis_mode=self._reframe_mode()
+        config["ai_camera_director"] = self._needs_ai_director(analysis_mode)
         config["target_aspect"] = self._preview_target_ratio()
         project_path=self.project_dir(); target_aspect=config["target_aspect"]; device=str(self.app.config.get("transcribe_device") or "auto")
         def worker(*,signals,cancel_check):
@@ -2444,6 +2838,7 @@ class ClipperPage(QWidget):
             from chopster.clipper.transcript_manager import Transcript
             self.transcript=Transcript.from_dict(res["transcript"]); self.candidates=res["candidates"]; self.clips=res["clips"]; self.focus_points=res.get("focus",[])
             self._preview_quick_focus=[]
+            self._remember_split_evidence(res.get("master") if isinstance(res.get("master"),dict) else {}, res.get("split"))
             self._render_transcript(); self._render_highlights(); self._render_clips()
             try:
                 self.bottom.setCurrentWidget(self._clip_queue_tab)
@@ -2481,4 +2876,3 @@ class ClipperPage(QWidget):
         text=str(msg or "").strip(); low=text.lower()
         important=("error" in low or "gagal" in low or "berhasil" in low or "selesai" in low or "dibatalkan" in low or text.startswith("✓") or text.startswith("✗"))
         if hasattr(self,"log") and important:self.log.append(text)
-

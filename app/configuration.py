@@ -2,8 +2,6 @@
 from __future__ import annotations
 
 import json
-import os
-from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any
 
@@ -14,7 +12,7 @@ from chopster.app.paths import app_dir, user_data_dir
 
 DEFAULTS: dict[str, Any] = {
     # general
-    "theme": "dark",  # dark | light
+    "theme": "dark",  # dark | modern | 3d | casual
     "language": "id",
     "window_width": 1280,
     "window_height": 860,
@@ -88,6 +86,51 @@ DEFAULTS: dict[str, Any] = {
     "acs_proxy": "",
     "acs_supadata_keys": "",
     "acs_cookies_file": "",
+    # Automation (publishing/scheduling engine)
+    "aut_max_concurrent": 2,
+    "aut_retry_limit": 3,
+    # TikTok publish path: "inbox" = official Upload API (video.upload) sends a
+    # draft to the user's TikTok inbox for manual publish; "direct" = Direct Post
+    # (video.publish, needs the app audited for public visibility).
+    "aut_tiktok_mode": "inbox",
+    "aut_acs_handoff": True,
+    "aut_cca_handoff": True,
+    "aut_autopilot_enabled": True,
+    # Whisper model used to transcribe media that carries no transcript of its
+    # own (files imported from disk). Floored at "small" — see
+    # chopster.automation.local_transcribe.
+    "aut_pack_whisper_model": "small",
+    "aut_publish_fallback": "ask",        # ask | browser | api
+    "aut_timezone_label": "local",
+    "aut_youtube_client_id": "",
+    "aut_youtube_client_secret": "",
+    "aut_facebook_client_id": "",
+    "aut_facebook_client_secret": "",
+    "aut_tiktok_client_id": "",
+    "aut_tiktok_client_secret": "",
+    "aut_instagram_client_id": "",
+    "aut_instagram_client_secret": "",
+    # Fixed loopback OAuth callback — register this EXACT value in each
+    # platform's developer console (Meta/TikTok reject unregistered URIs).
+    "aut_oauth_redirect_uri": "http://localhost:51234/",
+    "aut_browser_headless": False,
+    "aut_browser_action_timeout_ms": 15000,
+    "aut_browser_nav_timeout_ms": 30000,
+    # Playwright browser engine: "msedge" / "chrome" launch the installed branded
+    # browser (no Chromium download), "bundled" uses the Playwright Chromium.
+    "aut_browser_channel": "msedge",
+    "aut_keep_diagnostics": False,
+    # Opt-in: minimize the browser window while a browser-lane publish runs.
+    "aut_browser_minimize": False,
+    # Diagnostics / safety (additive, default OFF so existing behaviour is kept):
+    #   * aut_browser_test_mode: browser-lane jobs run as a dry-run (no real post),
+    #   * aut_browser_soft_cap: 0 = disabled; > 0 parks browser submissions after
+    #     that many real attempts per account in 24h (conservative guard),
+    #   * aut_policy_review:   {platform: {"date","scope","source"}} record of the
+    #     platform's automation-policy review (evidence kept per platform).
+    "aut_browser_test_mode": False,
+    "aut_browser_soft_cap": 0,
+    "aut_policy_review": {},
     # editor / production
     "subtitle_preset": "Bold creator",
     "subtitle_animation": "pop",
@@ -149,7 +192,12 @@ SPEED_PRESETS: dict[str, int] = {
 class Configuration:
     """JSON-backed configuration with migration from legacy settings.json."""
 
-    _SECRET_KEYS = ("ai_api_key", "acs_gemini_key")
+    # Secrets ride the existing DPAPI store and are stripped from settings.json.
+    _SECRET_KEYS = (
+        "ai_api_key", "acs_gemini_key",
+        "aut_youtube_client_secret", "aut_facebook_client_secret",
+        "aut_tiktok_client_secret", "aut_instagram_client_secret",
+    )
 
     def __init__(self, data_dir: str | Path | None = None) -> None:
         self._data_dir = Path(data_dir) if data_dir is not None else user_data_dir()

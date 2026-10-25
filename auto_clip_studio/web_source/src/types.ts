@@ -61,6 +61,7 @@ export type TitlePosition = 'auto' | 'safe_zone' | 'middle' | 'none';
 export type TitleDurationOption = 'entire' | '5s' | '10s';
 export type SubtitlePositionMode = 'bottom' | 'center';
 export type StreamerPreset = 'none' | 'split_top_cam' | 'pip_corner';
+export type SplitScreenOption = 'none' | 'two_person' | 'reaction_split';
 export type FacecamPosition = 'auto' | 'bottom_right' | 'top_right' | 'bottom_left' | 'top_left' | 'center' | 'left' | 'right';
 export type FontSizeOption = 'small' | 'medium' | 'big';
 export type TextCaseOption = 'uppercase' | 'capitalize' | 'lowercase';
@@ -91,6 +92,12 @@ export interface RenderSettings {
   backgroundStyle: BackgroundStyle;
   enableFaceTracking: boolean;
   streamerPreset: StreamerPreset;
+  /**
+   * New split-screen compositions (optional, defaults to 'none'):
+   * 'two_person'     -> permanent top/bottom two-person layout,
+   * 'reaction_split' -> temporary side-by-side while two people react.
+   */
+  splitScreen?: SplitScreenOption;
   facecamPosition?: FacecamPosition;
   titleText?: string;
   titlePrefix?: string;

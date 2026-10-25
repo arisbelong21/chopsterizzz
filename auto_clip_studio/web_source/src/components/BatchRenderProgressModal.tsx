@@ -175,15 +175,6 @@ export const BatchRenderProgressModal: React.FC<BatchRenderProgressModalProps> =
                     : `🔄 Retry Failed (${progress.clips.filter(c => c.status === 'error').length})`}
                 </button>
               )}
-              {progress.zip_url && (
-                <a
-                  href={progress.zip_url}
-                  download
-                  className="glowing-btn batch-zip-download-btn"
-                >
-                  {t.batchProgress.downloadZip}
-                </a>
-              )}
               <button className="studio-btn-cancel" onClick={onClose}>
                 {t.batchProgress.closeStudio}
               </button>

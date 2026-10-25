@@ -412,13 +412,38 @@ async def get_clip_frame(video_id: str, timestamp: float = 0.0, video_url: Optio
     raise HTTPException(status_code=404, detail="Real video frame could not be extracted yet")
 
 
+async def _attach_split_probe(box: dict, source: str) -> None:
+    """Additive two-person/split probe for the Clip Studio preview.
+
+    ``split_reason`` and ``split_layout`` explain *why* the probe found (or did
+    not find) two people, so the UI can report the real state instead of a
+    generic "not found" message.
+    """
+    try:
+        from chopster.auto_clip_studio.engine.video_engine import detect_two_person_boxes
+        info = await asyncio.to_thread(detect_two_person_boxes, str(source))
+        layout = info.get("layout") if isinstance(info.get("layout"), dict) else {}
+        box["panels"] = info.get("panels") or []
+        box["split_found"] = bool(info.get("found"))
+        box["split_reason"] = str(info.get("reason") or "")
+        box["split_layout"] = str(layout.get("kind") or "")
+        box["split_confidence"] = float(layout.get("confidence") or 0.0)
+    except Exception:
+        box["panels"] = []
+        box["split_found"] = False
+        box["split_reason"] = "detection failed"
+        box["split_layout"] = ""
+        box["split_confidence"] = 0.0
+
+
 @router.get("/api/detect-face")
 async def detect_face(
     video_id: str,
     timestamp: float = 0.0,
     video_url: Optional[str] = None,
     facecam_position: Optional[str] = "auto",
-    streamer_preset: Optional[str] = "none"
+    streamer_preset: Optional[str] = "none",
+    with_panels: bool = False
 ):
     """Detects speaker face coordinates and returns the frame URL."""
     _validate_frame_source(video_id, video_url)
@@ -446,6 +471,10 @@ async def detect_face(
                 streamer_preset or "none"
             )
             box["frame_url"] = f"/api/clip-frame?video_id={video_id}&timestamp={timestamp}"
+            # Optional additive info: the two-person split plan visible at this
+            # moment (same data the renderer uses for the permanent layout).
+            if with_panels:
+                await _attach_split_probe(box, frame_path)
             return box
 
         # If frame extract didn't complete, check local candidates
@@ -460,6 +489,8 @@ async def detect_face(
                     streamer_preset or "none"
                 )
                 box["frame_url"] = f"/api/clip-frame?video_id={video_id}&timestamp={timestamp}"
+                if with_panels:
+                    await _attach_split_probe(box, str(candidate))
                 return box
     except Exception as e:
         logger.warning(f"Face detection API error: {e}")

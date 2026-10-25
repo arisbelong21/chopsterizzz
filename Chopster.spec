@@ -57,6 +57,7 @@ hiddenimports = [
 ]
 hiddenimports += collect_submodules("yt_dlp")
 hiddenimports += collect_submodules("chopster.auto_clip_studio.engine")
+hiddenimports += collect_submodules("chopster.automation")
 # ASGI stack lazy imports. uvicorn resolves several classes by string at
 # runtime (e.g. "uvicorn.logging.DefaultFormatter"), so every uvicorn submodule
 # must be bundled or the embedded Auto Clip Studio backend fails to start with
@@ -77,6 +78,22 @@ for package in ("faster_whisper", "ctranslate2", "av", "curl_cffi"):
     datas += package_datas
     binaries += package_binaries
     hiddenimports += package_hiddenimports
+
+# Playwright is an OPTIONAL dependency (Browser Session mode). Collect it only
+# when it is installed in the build environment so the EXE can actually drive a
+# browser; a build without it still produces a working Direct-API-only Chopster.
+# The Chromium/Edge binary itself is launched from the system, never bundled.
+try:
+    import importlib.util
+
+    if importlib.util.find_spec("playwright") is not None:
+        pw_datas, pw_binaries, pw_hiddenimports = collect_all("playwright")
+        datas += pw_datas
+        binaries += pw_binaries
+        hiddenimports += pw_hiddenimports
+except Exception:
+    # Never fail the whole build because the optional package is absent.
+    pass
 
 a = Analysis(
     [str(ROOT / "main.py")],

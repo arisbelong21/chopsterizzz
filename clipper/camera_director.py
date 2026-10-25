@@ -341,6 +341,24 @@ def _coerce_target_id(target: str, faces: list[dict]) -> str:
     return ""
 
 
+def _valid_split_pair(raw, faces: list[dict]) -> list[str]:
+    """Validate an optional AI two-person pair against the local frame subjects.
+
+    The AI is only allowed to point at people that the local tracker already
+    found in that frame, so a reaction split can never reference an invented or
+    absent person. The pair is dropped (not guessed) when it is incomplete.
+    """
+    if not isinstance(raw, (list, tuple)):
+        return []
+    known = [str(f.get("id")) for f in faces or []]
+    out: list[str] = []
+    for item in raw:
+        tid = _coerce_target_id(str(item), faces)
+        if tid and tid in known and tid not in out:
+            out.append(tid)
+    return out[:2] if len(out) >= 2 else []
+
+
 def _local_motion_shots(timeline: list[dict], *, min_switch_seconds: float = 2.0) -> list[dict]:
     """Build a deterministic speaker-like camera plan from mouth-motion evidence.
 
@@ -547,6 +565,9 @@ def ai_camera_director_visual(
         "Tujuan: fokus ke orang yang sedang berbicara atau bereaksi penting, tanpa mengikuti gerakan kepala kecil. "
         "Jika dua orang terlalu dekat/terlalu besar untuk portrait, pilih shot=fit atau two. "
         "Jangan membuat id baru. Jika yakin speaker yang aktif berubah, target_id harus berubah. "
+        "Opsional: jika pada satu frame DUA orang yang ada di FRAME SUBJECT MAP sama-sama bereaksi penting "
+        "(kaget, tertawa, saling menatap), tambahkan field split_pair berisi dua id BERBEDA dari frame itu. "
+        "Hilangkan field split_pair kalau hanya satu orang yang relevan. "
         "Kembalikan JSON object SAJA: {\"decisions\":[{\"frame\":1,\"target_id\":\"1\",\"shot\":\"solo\",\"confidence\":0.9,\"reason\":\"...\"}]} . "
         "Harus ada satu decision untuk setiap frame yang kamu lihat.\n\nFRAMES:\n"+labels+
         "\n\nFRAME SUBJECT MAP (ID LOKAL, WAJIB DIPAKAI):\n"+json.dumps(frame_maps,ensure_ascii=False)+
@@ -591,7 +612,11 @@ def ai_camera_director_visual(
                 continue
             shot=str(d.get("shot") or "solo").lower()
             if shot not in {"solo","two","group","fit"}: shot="solo"
-            normalized.append({"frame":fi,"time":times[fi],"target_id":tid,"shot":shot,"confidence":float(d.get("confidence",.75) or .75),"reason":str(d.get("reason") or "Gemini visual camera decision")})
+            entry={"frame":fi,"time":times[fi],"target_id":tid,"shot":shot,"confidence":float(d.get("confidence",.75) or .75),"reason":str(d.get("reason") or "Gemini visual camera decision")}
+            pair=_valid_split_pair(d.get("split_pair"), faces)
+            if pair:
+                entry["split_pair"]=pair
+            normalized.append(entry)
         normalized.sort(key=lambda x:x["frame"])
         # Fill missing frames using nearest valid decision, otherwise local plan.
         if len(normalized)<max(1,len(times)//2):
@@ -607,17 +632,22 @@ def ai_camera_director_visual(
         # Compact consecutive identical decisions into real shot intervals.
         shots=[]; current=completed[0]; start_t=completed[0]["time"]
         for item in completed[1:]:
-            same=(item["target_id"]==current["target_id"] and item["shot"]==current["shot"])
+            # A reaction pair belongs to the decision, so a change of pair also
+            # ends the interval instead of extending the previous moment.
+            same=(item["target_id"]==current["target_id"] and item["shot"]==current["shot"]
+                  and item.get("split_pair")==current.get("split_pair"))
             if not same:
                 end_t=float(item["time"])
                 if end_t-start_t >= 1.2:
-                    shots.append({"start":start_t,"end":end_t,"target_id":current["target_id"],"shot":current["shot"],"confidence":current.get("confidence",0.92),"reason":current["reason"]})
+                    shots.append({"start":start_t,"end":end_t,"target_id":current["target_id"],"shot":current["shot"],"confidence":current.get("confidence",0.92),"reason":current["reason"],
+                                  **({"split_pair":list(current["split_pair"])} if current.get("split_pair") else {})})
                     current=item; start_t=float(item["time"])
                 else:
                     # Ignore tiny oscillations and keep the locked shot.
                     continue
         final_end=max(start_t+1.5,float(completed[-1]["time"])+1.5)
-        shots.append({"start":start_t,"end":final_end,"target_id":current["target_id"],"shot":current["shot"],"confidence":current.get("confidence",0.92),"reason":current["reason"]})
+        shots.append({"start":start_t,"end":final_end,"target_id":current["target_id"],"shot":current["shot"],"confidence":current.get("confidence",0.92),"reason":current["reason"],
+                      **({"split_pair":list(current["split_pair"])} if current.get("split_pair") else {})})
         return shots or local_plan()
     except Exception:
         return local_plan()

@@ -21,6 +21,18 @@ class Application:
         self.db = Database()
         max_threads = max(2, int(self.config.get("parallel", 2)) + 2)
         self.tasks = TaskManager(max_threads=max_threads)
+        # Automation engine (publishing/scheduling) — additive, failure-tolerant.
+        self.automation = None
+        try:
+            from chopster.automation.manager import AutomationManager
+            self.automation = AutomationManager(self)
+            self.automation.start()
+        except Exception as exc:
+            self.automation = None
+            try:
+                self.logger.error("Automation manager failed to start: %s", exc)
+            except Exception:
+                pass
         self.logger.info("Chopster initialized")
         # Browser bridge is deliberately lazy: the UI is created first and the
         # socket thread is started by main.py through QTimer.singleShot(0, ...).
@@ -75,6 +87,13 @@ class Application:
     def shutdown(self) -> None:
         if self._shutdown_done:
             return
+        # 1) Reject new automation claims, cancel in-flight publish work, and
+        #    join its worker threads before Qt tasks / config / db are torn down.
+        try:
+            if self.automation is not None:
+                self.automation.stop()
+        except Exception:
+            pass
         # Workers can still emit progress and use config/database during cancel.
         # Never tear down these dependencies before the pool has drained.
         self.tasks.shutdown()

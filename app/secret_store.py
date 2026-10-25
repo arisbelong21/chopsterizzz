@@ -86,8 +86,8 @@ def _dpapi(data: bytes, *, protect: bool) -> bytes:
 class WindowsSecretStore:
     """Small DPAPI encrypted map stored under the current user's app-data folder."""
 
-    def __init__(self, data_dir: str | Path):
-        self.path = Path(data_dir) / "secrets.dpapi"
+    def __init__(self, data_dir: str | Path, filename: str = "secrets.dpapi"):
+        self.path = Path(data_dir) / filename
 
     @property
     def available(self) -> bool:

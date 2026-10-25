@@ -412,16 +412,25 @@ def _ensure_windows_compatible_mp4(path: str, log_callback=None) -> str:
                 log_callback("Menyesuaikan codec ke H.264/AAC agar video kompatibel dengan pemutar Windows…")
             except Exception:
                 pass
-        proc = subprocess.run(
-            [
-                ffmpeg, "-hide_banner", "-loglevel", "error", "-y", "-i", str(source),
-                "-map", "0:v:0", "-map", "0:a:0?", "-map_metadata", "0",
-                "-c:v", "libx264", "-preset", "medium", "-crf", "20", "-pix_fmt", "yuv420p",
-                "-c:a", "aac", "-b:a", "192k", "-ac", "2",
-                "-movflags", "+faststart", "-f", "mp4", temp_path,
-            ],
-            capture_output=True, text=True, encoding="utf-8", errors="replace",
-        )
+        ffmpeg_flags = getattr(subprocess, "CREATE_NO_WINDOW", 0) if os.name == "nt" else 0
+        try:
+            proc = subprocess.run(
+                [
+                    ffmpeg, "-hide_banner", "-loglevel", "error", "-y", "-i", str(source),
+                    "-map", "0:v:0", "-map", "0:a:0?", "-map_metadata", "0",
+                    "-c:v", "libx264", "-preset", "medium", "-crf", "20", "-pix_fmt", "yuv420p",
+                    "-c:a", "aac", "-b:a", "192k", "-ac", "2",
+                    "-movflags", "+faststart", "-f", "mp4", temp_path,
+                ],
+                capture_output=True, text=True, encoding="utf-8", errors="replace",
+                # Every sibling ffmpeg/ffprobe call in this module is bounded;
+                # without a timeout a stuck encoder could hang the whole batch
+                # (this runs inside a ThreadPoolExecutor worker with no watchdog).
+                timeout=3600,
+                creationflags=ffmpeg_flags,
+            )
+        except subprocess.TimeoutExpired as exc:
+            raise RuntimeError("Konversi H.264/AAC melebihi batas waktu dan dihentikan.") from exc
         if proc.returncode != 0 or not Path(temp_path).is_file() or Path(temp_path).stat().st_size == 0:
             detail = (proc.stderr or "").strip()[-500:]
             raise RuntimeError(f"Konversi H.264/AAC gagal. {detail}".strip())

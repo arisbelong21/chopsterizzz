@@ -1,0 +1,83 @@
+# ============================================================
+# Chopster - .gitignore
+# Tujuan: repo GitHub hanya berisi kode sumber, bukan artefak
+# build, environment virtual, atau data pribadi.
+# ============================================================
+
+# --- Python: cache & bytecode ---
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# --- Virtual environment ---
+.venv/
+.venv-*/
+venv/
+env/
+ENV/
+
+# --- Build & distribusi (dibuat ulang oleh build_exe.bat) ---
+build/
+dist/
+*.spec.bak
+*.manifest
+
+# --- Hasil test / cache tool ---
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+.coverage.*
+htmlcov/
+.cache/
+
+# --- Node / frontend ---
+node_modules/
+*.tsbuildinfo
+npm-debug.log*
+
+# --- Log & file sementara ---
+*.log
+*.tmp
+*.temp
+*.bak
+*.orig
+*.rej
+
+# --- Data pribadi / kredensial (JANGAN pernah di-commit) ---
+*.dpapi
+*.db
+*.db-journal
+*.sqlite
+*.sqlite3
+settings.json
+cookies*.txt
+*.cookies
+.env
+.env.*
+!.env.template
+!.env.example
+acs_retired_models.json
+*.pem
+*.key
+*.pfx
+
+# --- Font sistem berlisensi (jangan didistribusikan ulang) ---
+# video_engine.py otomatis memakai C:/Windows/Fonts/seguiemj.ttf bila file ini tidak ada.
+auto_clip_studio/engine/fonts/seguiemj.ttf
+
+# --- Patch lokal / catatan pribadi ---
+*.patch.bak
+
+# --- OS & editor ---
+Thumbs.db
+ehthumbs.db
+desktop.ini
+.DS_Store
+.vscode/
+.idea/
+*.swp
+
+# Catatan: auto_clip_studio/web_dist/ SENGAJA tidak diabaikan,
+# karena bundle UI hasil build dipakai saat membangun EXE.

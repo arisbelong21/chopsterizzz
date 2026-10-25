@@ -174,35 +174,9 @@ def download_rendered_file(file_name: str, title: Optional[str] = None):
 
 @router.get("/api/download-batch-zip/{batch_id}")
 def download_batch_zip(batch_id: str):
-    clean_id = os.path.basename(batch_id)
-    safe_name = f"chopster_by_aris_autoclip_{clean_id}.zip"
-    request = BATCH_REQUESTS.get(batch_id)
-    output_dir = resolve_output_directory(request.settings.output_dir if request else None)
-    file_path = output_dir / safe_name
-    if not file_path.exists():
-        # Attempt to package any completed clips for this batch on the fly
-        job = RENDER_BATCHES.get(batch_id)
-        if job and job.get("clips"):
-            try:
-                title_counts: Dict[str, int] = {}
-                with zipfile.ZipFile(file_path, "w", zipfile.ZIP_DEFLATED) as zipf:
-                    for c in job["clips"]:
-                        c_out = c.get("output_path")
-                        if not c_out and c.get("download_url"):
-                            fname = c["download_url"].split("/")[-1]
-                            c_out = str(output_dir / fname)
-                        if c_out and os.path.exists(c_out):
-                            raw_title = (c.get("title") or "").strip()
-                            clean_title = re.sub(r'[\\/*?:"<>|]', "", raw_title) or os.path.splitext(os.path.basename(c_out))[0]
-                            count = title_counts.get(clean_title, 0)
-                            title_counts[clean_title] = count + 1
-                            arc_name = f"{clean_title}.mp4" if count == 0 else f"{clean_title} ({count}).mp4"
-                            zipf.write(c_out, arcname=arc_name)
-            except Exception as e:
-                logger.error(f"Error packaging batch zip on the fly: {e}")
-    if not file_path.exists():
-        raise HTTPException(status_code=404, detail="Batch zip file not found")
-    return FileResponse(file_path, media_type="application/zip", filename=safe_name)
+    # ZIP bundling was removed: clips are exported as individual MP4 files named
+    # after their AI titles. This route is kept only to answer old links clearly.
+    raise HTTPException(status_code=404, detail="ZIP export is disabled. Download the clips individually.")
 
 
 @router.get("/api/hardware-accel")

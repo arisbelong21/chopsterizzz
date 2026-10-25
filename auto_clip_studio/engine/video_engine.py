@@ -10,6 +10,7 @@ import subprocess
 import unicodedata
 import math
 import urllib.parse
+import urllib.request
 from pathlib import Path
 from typing import List, Dict, Any, Optional, Tuple, Union
 from PIL import Image, ImageDraw, ImageFont
@@ -110,14 +111,22 @@ def get_whisper_model():
 
             class _FasterWhisperAdapter:
                 """Expose faster-whisper through the API used by the original engine."""
-                def __init__(self):
-                    logger.info("Loading faster-whisper 'base' model...")
-                    self.model = WhisperModel("base", device="cpu", compute_type="int8")
+                def __init__(self, size: str = "base", device: str = "cpu", compute_type: str = "int8"):
+                    logger.info(f"Loading faster-whisper '{size}' model...")
+                    self.model = WhisperModel(size, device=device, compute_type=compute_type)
                     logger.info("Whisper is running in CPU int8 safe mode (no CUDA/cuDNN dependency).")
 
-                def transcribe(self, path, word_timestamps=True, **_kwargs):
+                def transcribe(self, path, word_timestamps=True, language=None, task="transcribe", **_kwargs):
+                    """`language` (ISO code) pins the spoken language instead of letting Whisper
+                    guess on its own - this is what prevents Indonesian audio from being
+                    transcribed into English. `task` is always 'transcribe': 'translate' is never
+                    used because captions must stay in the video's original spoken language."""
                     segments, info = self.model.transcribe(
-                        path, word_timestamps=word_timestamps, vad_filter=True
+                        path,
+                        word_timestamps=word_timestamps,
+                        vad_filter=True,
+                        language=(language or None),
+                        task=task,
                     )
                     converted = []
                     for seg in segments:
@@ -137,7 +146,14 @@ def get_whisper_model():
                         })
                     return {"language": getattr(info, "language", None), "segments": converted}
 
-            _WHISPER_MODEL = _FasterWhisperAdapter()
+            _WHISPER_MODEL = _FasterWhisperAdapter(
+                # 'small' (not 'base') for reliable language detection: 'base' frequently
+                # mislabels Indonesian audio as English on short/noisy clips. Override with
+                # ACS_WHISPER_MODEL (e.g. 'base', 'medium', 'large-v3') to trade accuracy for speed.
+                size=(os.environ.get("ACS_WHISPER_MODEL") or "small").strip() or "small",
+                device=(os.environ.get("ACS_WHISPER_DEVICE") or "cpu").strip() or "cpu",
+                compute_type=(os.environ.get("ACS_WHISPER_COMPUTE_TYPE") or "int8").strip() or "int8",
+            )
         except Exception as e:
             logger.warning(f"Could not load Whisper model: {e}")
             _WHISPER_MODEL = False
@@ -534,11 +550,19 @@ def compute_audio_energy_heatmap(file_path: Union[str, Path], duration: float, n
     return heatmap
 
 
-def transcribe_local_video_file(file_path: Union[str, Path], progress_callback=None) -> List[Dict[str, Any]]:
+def transcribe_local_video_file(
+    file_path: Union[str, Path],
+    progress_callback=None,
+    language: Optional[str] = None
+) -> List[Dict[str, Any]]:
     """
     Transcribes speech from a local video or audio file using OpenAI Whisper.
     Returns standard transcript segments formatted as:
     [{"text": "...", "start": 0.0, "duration": 3.5}, ...]
+
+    `language` (optional ISO code, e.g. 'id') pins the spoken language so Whisper never
+    falls back to English output for non-English audio. Leave it None to let Whisper
+    auto-detect the language from the audio.
     """
     p = Path(file_path)
     if not p.exists():
@@ -554,8 +578,19 @@ def transcribe_local_video_file(file_path: Union[str, Path], progress_callback=N
     if progress_callback:
         progress_callback("Running Whisper AI", f"Extracting dialogue from {p.name} with Whisper...", 30)
 
-    logger.info(f"Transcribing local file with Whisper: {p}")
-    result = whisper_model.transcribe(str(p), word_timestamps=True, fp16=False, verbose=False)
+    language_hint = (language or "").strip() or None
+    logger.info(f"Transcribing local file with Whisper: {p} (language hint: {language_hint or 'auto'})")
+    result = whisper_model.transcribe(
+        str(p),
+        word_timestamps=True,
+        fp16=False,
+        verbose=False,
+        language=language_hint,
+        task="transcribe"
+    )
+    detected_language = result.get("language")
+    if detected_language:
+        logger.info(f"Whisper detected spoken language: {detected_language}")
     
     segments = result.get("segments", [])
     transcript_lines = []
@@ -1172,8 +1207,13 @@ def transcribe_clip_words(
     whisper_model = get_whisper_model()
     if whisper_model is not None:
         try:
+            # No language hint here on purpose: the clip audio is the only source of truth
+            # available, so Whisper auto-detects the language and transcribes it as-is
+            # (task='transcribe' never translates the speech into English).
             logger.info("Running Whisper word-level transcription as fallback...")
-            result = whisper_model.transcribe(video_path, word_timestamps=True, fp16=False)
+            result = whisper_model.transcribe(
+                video_path, word_timestamps=True, fp16=False, task="transcribe"
+            )
             words = []
             for segment in result.get("segments", []):
                 for w in segment.get("words", []):
@@ -2368,6 +2408,284 @@ def detect_speaker_center_ratio(video_path: str, facecam_position: str = "auto",
     return float(box.get("cx", 0.5))
 
 
+_ACS_SPLIT_DETECTOR = None
+
+
+def _get_acs_face_detector():
+    """Lazy YuNet/Haar loader shared by the split-screen helpers below."""
+    global _ACS_SPLIT_DETECTOR
+    if _ACS_SPLIT_DETECTOR is not None:
+        return _ACS_SPLIT_DETECTOR
+    import cv2
+    yunet_detector = None
+    cascades = []
+    for cand in [YUNET_MODEL_PATH, BASE_DIR / "face_detection_yunet.onnx", BASE_DIR / "cascades" / "face_detection_yunet.onnx"]:
+        if cand.exists():
+            try:
+                yunet_detector = cv2.FaceDetectorYN.create(str(cand), "", (320, 320), 0.65, 0.3, 5000)
+            except Exception:
+                yunet_detector = None
+            break
+    try:
+        for name in ("haarcascade_frontalface_alt2.xml", "haarcascade_frontalface_default.xml", "haarcascade_profileface.xml"):
+            cascade_path = cv2.data.haarcascades + name
+            cc = cv2.CascadeClassifier(str(cascade_path))
+            if not cc.empty():
+                cascades.append(cc)
+    except Exception:
+        pass
+    _ACS_SPLIT_DETECTOR = (yunet_detector, cascades)
+    return _ACS_SPLIT_DETECTOR
+
+
+def _acs_single_frame_faces(frame, yunet_detector, cascades) -> List[Dict[str, Any]]:
+    """Normalized face boxes for one frame (YuNet first, Haar fallback)."""
+    import cv2
+    fh, fw = frame.shape[:2]
+    faces = []
+    if yunet_detector is not None:
+        try:
+            yunet_detector.setInputSize((fw, fh))
+            _, res = yunet_detector.detect(frame)
+            if res is not None and len(res) > 0:
+                for f in res:
+                    x, y, w, h = f[0:4]
+                    if float(w) / fw >= 0.02 and float(h) / fh >= 0.02:
+                        faces.append({"cx": float((x + w / 2.0) / fw), "cy": float((y + h / 2.0) / fh),
+                                      "w": float(w / fw), "h": float(h / fh), "conf": float(f[-1]), "source": "yunet"})
+                if faces:
+                    return faces
+        except Exception:
+            pass
+    if cascades:
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        min_sz = max(36, int(fh * 0.06))
+        for cascade in cascades:
+            try:
+                dets = cascade.detectMultiScale(gray, scaleFactor=1.1, minNeighbors=6, minSize=(min_sz, min_sz))
+            except Exception:
+                dets = ()
+            for (fx, fy, bw, bh) in dets:
+                facet = float(bw) / float(bh)
+                if 0.6 <= facet <= 1.45:
+                    faces.append({"cx": float((fx + bw / 2.0) / fw), "cy": float((fy + bh / 2.0) / fh),
+                                  "w": float(bw / fw), "h": float(bh / fh), "conf": 0.70, "source": "haar"})
+            if faces:
+                break
+    return faces
+
+
+def _probe_video_size(path) -> Tuple[int, int]:
+    """Return (width, height) of the first video stream via ffprobe."""
+    cmd = ["ffprobe", "-v", "error", "-select_streams", "v:0",
+           "-show_entries", "stream=width,height", "-of", "csv=s=x:p=0", str(path)]
+    res = subprocess.run(cmd, capture_output=True, text=True, timeout=8)
+    w, h = map(int, res.stdout.strip().split("x"))
+    return int(w), int(h)
+
+
+def _static_split_panel(panel_id: str, box, duration: float) -> Optional[Dict[str, Any]]:
+    """Wrap one normalized detection box into a split_screen-compatible panel."""
+    cx = max(0.0, min(1.0, float(box.get("cx", 0.5))))
+    cy = max(0.0, min(1.0, float(box.get("cy", 0.35))))
+    w = max(0.04, min(0.98, float(box.get("w", 0.22))))
+    h = max(0.04, min(0.98, float(box.get("h", 0.25))))
+    left = max(0.0, cx - w / 2.0)
+    right = min(1.0, cx + w / 2.0)
+    top = max(0.0, cy - h / 2.0)
+    bottom = min(1.0, cy + h / 2.0)
+    if right - left < 0.02 or bottom - top < 0.02:
+        return None
+    at0 = {"t": 0.0, "cx": cx, "cy": cy, "left": left, "right": right, "top": top, "bottom": bottom}
+    at_end = {"t": max(0.02, float(duration)), "cx": cx, "cy": cy, "left": left, "right": right, "top": top, "bottom": bottom}
+    return {
+        "id": str(panel_id),
+        "coverage": 1.0,
+        "cx": cx, "cy": cy,
+        "box": {"left": left, "right": right, "top": top, "bottom": bottom},
+        "samples": [at0, at_end],
+    }
+
+
+def _acs_subject_box(det: Dict[str, Any]) -> Dict[str, float]:
+    """Normalized envelope of one ACS face detection (used to aim a feed panel)."""
+    cx = float(det.get("cx", 0.5) or 0.5)
+    cy = float(det.get("cy", 0.5) or 0.5)
+    w = float(det.get("w", 0.2) or 0.2)
+    h = float(det.get("h", 0.25) or 0.25)
+    return {"left": max(0.0, cx - w / 2.0), "right": min(1.0, cx + w / 2.0),
+            "top": max(0.0, cy - h / 2.0), "bottom": min(1.0, cy + h / 2.0)}
+
+
+def _acs_panel_box(panel: Dict[str, Any]) -> Dict[str, float]:
+    """Compact ``cx/cy/w/h`` view of a split panel (additive info for callers)."""
+    box = panel.get("box") if isinstance(panel.get("box"), dict) else {}
+    left = float(box.get("left", 0.0) or 0.0)
+    right = float(box.get("right", 1.0) or 1.0)
+    top = float(box.get("top", 0.0) or 0.0)
+    bottom = float(box.get("bottom", 1.0) or 1.0)
+    return {"cx": round((left + right) / 2.0, 3), "cy": round((top + bottom) / 2.0, 3),
+            "w": round(max(0.02, right - left), 3), "h": round(max(0.02, bottom - top), 3)}
+
+
+def detect_two_person_boxes(source_path: str, max_samples: int = 20, *, guarantee: bool = False) -> Dict[str, Any]:
+    """Detect the two persistent people of a clip and their per-time activity.
+
+    Returns ``{"found", "panels", "timeline", "boxes", "duration"}`` where
+    ``panels`` (max two, left-to-right) can be passed straight into the same
+    composition builder used by the desktop clipper, and ``timeline`` is the
+    per-sample face map consumed by the reaction-split analysis (feature 2).
+
+    Sources that are *already* a two-feed side-by-side composition (OmeTV/Omegle
+    calls) are recognised as such (``layout``/``reason`` are additive): each
+    panel then shows its own feed and the detected faces only aim the crop
+    inside that feed, so small webcam faces no longer block the layout.
+
+    ``guarantee`` is used by the renderer of the explicitly selected permanent
+    two-person mode: when neither two people nor a feed seam could be verified,
+    the frame itself becomes the pair (left half on top, right half below) and
+    ``fallback`` is True, so the chosen mode always renders a real split instead
+    of silently falling back to the normal single-panel framing. The WYSIWYG
+    probe keeps ``guarantee=False``; it reports the honest detection state.
+    """
+    import cv2
+    from chopster.clipper.panel_layout import LAYOUT_STRONG_CONFIDENCE, LayoutProbe
+
+    empty = {"found": False, "panels": [], "timeline": [], "boxes": [], "duration": 0.0,
+             "layout": {}, "reason": "not analysed"}
+    if not source_path or not os.path.exists(source_path):
+        return empty
+    yunet_detector, cascades = _get_acs_face_detector()
+    if not yunet_detector and not cascades:
+        return empty
+    cap = cv2.VideoCapture(str(source_path))
+    if not cap.isOpened():
+        return empty
+    layout_probe = LayoutProbe()
+    try:
+        fps = max(1.0, float(cap.get(cv2.CAP_PROP_FPS) or 30.0))
+        total = max(1.0, float(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 1.0))
+        duration = float(total) / fps
+        fw = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH) or 1920)
+        fh = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT) or 1080)
+        n = max(2, min(int(max_samples or 20), 40))
+        detections = []
+        timeline = []
+        prev_faces = []  # [(cx, cy)] of the previous non-empty sample
+        for i in range(n):
+            target = int(round((i / max(1, n - 1)) * (total - 1)))
+            cap.set(cv2.CAP_PROP_POS_FRAMES, target)
+            ok, frame = cap.read()
+            if not ok or frame is None:
+                continue
+            t = target / fps
+            layout_probe.add(frame, t)
+            face_list = _acs_single_frame_faces(frame, yunet_detector, cascades)
+            sample_faces = []
+            for fi, f in enumerate(face_list):
+                motion = 0.0
+                if prev_faces:
+                    nearest = min(prev_faces, key=lambda p: (float(f["cx"]) - p[0]) ** 2 + (float(f["cy"]) - p[1]) ** 2)
+                    motion = min(12.0, math.hypot((float(f["cx"]) - nearest[0]) * fw, (float(f["cy"]) - nearest[1]) * fh) / 8.0)
+                left = max(0.0, min(1.0, float(f["cx"]) - float(f["w"]) / 2.0))
+                right = max(0.0, min(1.0, float(f["cx"]) + float(f["w"]) / 2.0))
+                top = max(0.0, min(1.0, float(f["cy"]) - float(f["h"]) / 2.0))
+                bottom = max(0.0, min(1.0, float(f["cy"]) + float(f["h"]) / 2.0))
+                sample_faces.append({"id": str(fi), "x": round(float(f["cx"]), 4), "y": round(float(f["cy"]), 4),
+                                     "left": round(left, 4), "right": round(right, 4),
+                                     "top": round(top, 4), "bottom": round(bottom, 4),
+                                     "motion": round(motion, 3)})
+                detections.append({"cx": float(f["cx"]), "cy": float(f["cy"]), "w": float(f["w"]), "h": float(f["h"])})
+            timeline.append({"t": round(t, 3), "faces": sample_faces})
+            prev_faces = [(float(f["cx"]), float(f["cy"])) for f in face_list]
+    finally:
+        cap.release()
+
+    def make_box(cluster):
+        cx = sum(d["cx"] for d in cluster) / len(cluster)
+        cy = sum(d["cy"] for d in cluster) / len(cluster)
+        w = min(0.98, max(0.06, (sum(d["w"] for d in cluster) / len(cluster)) * 1.15))
+        h = min(0.98, max(0.06, (sum(d["h"] for d in cluster) / len(cluster)) * 1.30))
+        return {"cx": float(round(cx, 3)), "cy": float(round(cy, 3)), "w": float(round(w, 3)), "h": float(round(h, 3))}
+
+    # Two people need at least two detections; a single face must never reach the
+    # clustering below (it used to raise and silently report "no two people").
+    face_boxes: List[Dict[str, Any]] = []
+    if len(detections) >= 2:
+        left = [d for d in detections if d["cx"] < 0.5]
+        right = [d for d in detections if d["cx"] >= 0.5]
+        if not left or not right:
+            ordered = sorted(detections, key=lambda d: d["cx"])
+            mid = max(1, len(ordered) // 2)
+            left, right = ordered[:mid], ordered[mid:] or ordered[-1:]
+        face_boxes = [make_box(left), make_box(right)]
+        face_boxes.sort(key=lambda b: b["cx"])
+
+    layout = layout_probe.analyze()
+    layout_plan: List[Dict[str, Any]] = []
+    if layout:
+        from chopster.clipper.split_screen import layout_panel_plan
+        layout_plan = layout_panel_plan(
+            layout["split_x"], start=0.0, end=max(0.5, float(duration)),
+            subjects=[_acs_subject_box(d) for d in detections],
+        )
+    use_layout = bool(layout_plan) and (
+        len(face_boxes) < 2 or float(layout.get("confidence") or 0.0) >= LAYOUT_STRONG_CONFIDENCE
+    )
+    if use_layout:
+        boxes = [_acs_panel_box(p) for p in layout_plan]
+        panels = list(layout_plan)
+        feed_timeline = layout_probe.timeline(layout["split_x"], duration=duration)
+        if feed_timeline:
+            timeline = feed_timeline
+        reason = "two-feed side-by-side layout"
+    else:
+        boxes = list(face_boxes)
+        panels = []
+        for idx, box in enumerate(boxes[:2]):
+            panel = _static_split_panel(f"acs-sc-{idx}", box, duration)
+            if panel:
+                panels.append(panel)
+        reason = "two tracked people" if len(panels) >= 2 else "fewer than two tracked people"
+
+    # Hard guarantee of the permanent split mode: the left/right halves of the
+    # frame are always a valid pair, so the selected mode keeps producing a real
+    # top/bottom composition even when every detector came back empty.
+    fallback = False
+    if guarantee and len([p for p in panels if p]) < 2:
+        from chopster.clipper.split_screen import forced_panel_plan
+        try:
+            panels = forced_panel_plan(
+                start=0.0, end=max(0.5, float(duration)),
+                split_x=(layout or {}).get("split_x"),
+                subjects=[_acs_subject_box(d) for d in detections],
+            )
+            if len([p for p in panels if p]) >= 2:
+                boxes = [_acs_panel_box(p) for p in panels]
+                fallback = True
+                reason = ("automatic left/right split (two-person mode always splits: "
+                          + ("one person detected" if detections else "no person detected") + ")")
+        except Exception as exc:
+            logger.warning(f"forced two-person panels skipped: {exc}")
+
+    return {"found": len(panels) >= 2, "panels": panels, "timeline": timeline, "boxes": boxes,
+            "duration": duration, "layout": layout or {}, "reason": reason, "fallback": fallback}
+
+
+def detect_reaction_windows(source_path: str, max_samples: int = 20) -> List[Dict[str, Any]]:
+    """Moments where two people are simultaneously active (feature 2, offline).
+
+    Uses the same deterministic ``reaction_split_windows`` rule as the desktop
+    clipper, so ACS and CCA produce the same side-by-side timing for the same
+    clip. Returns an empty list whenever fewer than two people were found.
+    """
+    from chopster.clipper.split_screen import reaction_split_windows
+    info = detect_two_person_boxes(source_path, max_samples=max_samples)
+    if len(info.get("boxes") or []) < 2:
+        return []
+    return reaction_split_windows(info.get("timeline") or [], start=0.0, end=float(info.get("duration") or 0.0))
+
+
 def build_ffmpeg_filtergraph(
     aspect_ratio: str,
     background_style: str,
@@ -2377,7 +2695,12 @@ def build_ffmpeg_filtergraph(
     title_position: str = "auto",
     ass_subtitles_path: Optional[str] = None,
     face_box: Optional[Dict[str, Any]] = None,
-    title_y_percent: Optional[float] = None
+    title_y_percent: Optional[float] = None,
+    split_screen: str = "none",
+    split_panels: Optional[List[Dict[str, Any]]] = None,
+    split_windows: Optional[List[Dict[str, Any]]] = None,
+    source_w: int = 1920,
+    source_h: int = 1080,
 ) -> Tuple[str, str]:
     """
     Constructs the FFmpeg -filter_complex chain with proper aspect ratio center-cropping.
@@ -2649,6 +2972,33 @@ def build_ffmpeg_filtergraph(
             )
         current_v = "[layout_base]"
 
+    # 1b. Optional split-screen compositions (new, non-destructive). They only
+    # swap or layer the base layout; every following layer (subtitles, title,
+    # watermark, BGM, SFX) keeps working on the resulting canvas.
+    split_kind = str(split_screen or "none").strip().lower()
+    if split_kind in ("two_person", "reaction_split"):
+        from chopster.clipper.split_screen import build_reaction_overlay, build_vstack_composition
+        canvas_w, canvas_h = (1920, 1080) if aspect_ratio == "16:9_landscape" else (1080, 1920)
+        if split_kind == "two_person":
+            panels = [p for p in (split_panels or []) if p]
+            if len(panels) >= 2:
+                graph, label = build_vstack_composition(
+                    panels, source_w=max(2, int(source_w)), source_h=max(2, int(source_h)),
+                    out_w=int(canvas_w), out_h=int(canvas_h),
+                )
+                # The base layout is *replaced* by the permanent top/bottom split.
+                filters = []
+                filters.append(graph)
+                current_v = label
+        elif split_kind == "reaction_split" and split_windows:
+            graph, label = build_reaction_overlay(
+                split_windows, source_w=max(2, int(source_w)), source_h=max(2, int(source_h)),
+                out_w=int(canvas_w), out_h=int(canvas_h), base_label=current_v,
+            )
+            if graph:
+                filters.append(graph)
+                current_v = label
+
     # 2. Subtitles & Title Burning via libass (.ass)
     # (If ass_subtitles_path is provided, it contains BOTH the title and subtitles rendered with exact matching fonts)
     if ass_subtitles_path and os.path.exists(ass_subtitles_path):
@@ -2737,7 +3087,11 @@ def render_clip_to_mp4(
     original_audio_volume: float = 1.0,
     # Hardware acceleration selection ('auto', 'nvenc', 'amf', 'qsv', 'cpu')
     hardware_accel: Optional[str] = "auto",
-    title_y_percent: Optional[float] = None
+    title_y_percent: Optional[float] = None,
+    # New split-screen compositions (''/none disables them).
+    split_screen: str = "none",
+    split_panels: Optional[List[Dict[str, Any]]] = None,
+    split_windows: Optional[List[Dict[str, Any]]] = None,
 ) -> str:
     """
     Renders the final 1080x1920 short-form video with layout, aspect ratio, titles, subtitles,
@@ -2763,6 +3117,42 @@ def render_clip_to_mp4(
             streamer_preset=streamer_preset
         )
 
+    # New split-screen compositions: the two-person split needs a stable pair of
+    # boxes, the reaction split needs per-time moments. Detection runs on the
+    # clip itself (already trimmed to its start/end), so geometry and timing are
+    # clip-relative exactly like every other filter in this function.
+    source_w, source_h = 1920, 1080
+    split_kind = str(split_screen or "none").strip().lower()
+    if split_kind in ("two_person", "reaction_split"):
+        try:
+            source_w, source_h = _probe_video_size(video_path)
+        except Exception:
+            source_w, source_h = 1920, 1080
+        if split_kind == "two_person" and not [p for p in (split_panels or []) if p]:
+            try:
+                # ``guarantee=True``: the mode is an explicit user choice, so the
+                # clip always gets its two panels (tracked pair -> measured feeds
+                # -> frame halves) instead of the normal single-panel framing.
+                split_info = detect_two_person_boxes(video_path, guarantee=True)
+                if len([p for p in (split_info.get("panels") or []) if p]) >= 2:
+                    split_panels = split_info.get("panels") or []
+            except Exception as exc:
+                logger.warning(f"two_person split detection skipped: {exc}")
+            if len([p for p in (split_panels or []) if p]) < 2:
+                # Last resort so a selected split mode can never render as a
+                # single panel: the frame halves themselves are the pair.
+                try:
+                    from chopster.clipper.split_screen import forced_panel_plan
+                    split_panels = forced_panel_plan(end=max(0.5, float(clip_duration or 0.0)))
+                    logger.info("two_person split: using the guaranteed frame-halves fallback")
+                except Exception as exc:
+                    logger.warning(f"forced two-person split skipped: {exc}")
+        elif split_kind == "reaction_split" and not split_windows:
+            try:
+                split_windows = detect_reaction_windows(video_path)
+            except Exception as exc:
+                logger.warning(f"reaction split detection skipped: {exc}")
+
     filter_complex, out_video_map = build_ffmpeg_filtergraph(
         aspect_ratio=aspect_ratio,
         background_style=background_style,
@@ -2772,7 +3162,12 @@ def render_clip_to_mp4(
         title_position=title_position,
         ass_subtitles_path=ass_subtitles_path,
         face_box=face_box,
-        title_y_percent=title_y_percent
+        title_y_percent=title_y_percent,
+        split_screen=split_screen,
+        split_panels=split_panels,
+        split_windows=split_windows,
+        source_w=source_w,
+        source_h=source_h,
     )
 
     filter_chains = [filter_complex]
@@ -3095,7 +3490,6 @@ def extract_clip_frame(video_url: str, video_id: str, timestamp: float = 0.0) ->
 
     # 4. Instant high-res thumbnail fallback (guarantees frame preview NEVER gets stuck)
     try:
-        import urllib.request
         for thumb_url in [
             f"https://i.ytimg.com/vi/{video_id}/maxresdefault.jpg",
             f"https://i.ytimg.com/vi/{video_id}/hqdefault.jpg",

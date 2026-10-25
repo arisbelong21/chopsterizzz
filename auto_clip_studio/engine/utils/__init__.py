@@ -5,6 +5,7 @@ from chopster.auto_clip_studio.engine.utils.text import (
     extract_video_id,
     lowercase_hashtags_in_string,
     detect_transcript_language,
+    resolve_language_override,
     sanitize_first_person_title,
     LANGUAGE_NAMES,
 )
@@ -23,6 +24,7 @@ __all__ = [
     "extract_video_id",
     "lowercase_hashtags_in_string",
     "detect_transcript_language",
+    "resolve_language_override",
     "sanitize_first_person_title",
     "LANGUAGE_NAMES",
     "get_average_heatmap_value",

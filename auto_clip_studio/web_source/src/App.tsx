@@ -147,6 +147,13 @@ export default function App() {
     return (saved === 'auto' || saved === 'custom') ? saved : 'auto';
   });
 
+  // Output language for generated titles, hooks, captions & hashtags.
+  // 'auto' lets the backend detect from the transcript/spoken language; 'id'/'en' force it.
+  const [outputLanguage, setOutputLanguage] = useState<'auto' | 'id' | 'en'>(() => {
+    const saved = localStorage.getItem('cheat_clip_output_language');
+    return (saved === 'id' || saved === 'en') ? saved : 'auto';
+  });
+
   // Custom range selection states
   const [rangeType, setRangeType] = useState<'entire' | 'custom'>('entire');
   const [customRangeStart, setCustomRangeStart] = useState<string>('');
@@ -356,11 +363,13 @@ export default function App() {
           video_url: url || `https://www.youtube.com/watch?v=${result.video_id}`,
           video_id: result.video_id,
           clips: settings.selectedClips,
+          language: outputLanguage,
           settings: {
             aspect_ratio: settings.aspectRatio,
             background_style: settings.backgroundStyle,
             enable_face_tracking: settings.enableFaceTracking,
             streamer_preset: settings.streamerPreset,
+            split_screen: settings.splitScreen || 'none',
             facecam_position: settings.facecamPosition || 'auto',
             title_text: settings.titleText,
             title_prefix: settings.titlePrefix || '',
@@ -1366,6 +1375,7 @@ export default function App() {
           subtitles: subtitlesSource === 'manual' ? manualSubtitlesContent : undefined,
           subtitles_filename: subtitlesSource === 'manual' ? manualSubtitlesFileName : undefined,
           target_clip_count: clipCountMode === 'auto' ? 'auto' : targetClipCount,
+          language: outputLanguage,
         }),
       });
 
@@ -1469,8 +1479,9 @@ export default function App() {
           const promptSuffix = customPrompt.trim() ? `_prompt_v2:${encodeURIComponent(customPrompt.trim())}` : '';
           const modelSuffix = `_model_${selectedModel}`;
           const clipsSuffix = clipCountMode === 'auto' ? '_clips_auto' : `_clips_${targetClipCount}`;
-          const targetCacheKey = `cheat_clip_cache_${resultData.video_id}_${durationPref}${modelSuffix}${clipsSuffix}${promptSuffix}${rangeSuffix}${manualSuffix}`;
-          const tsKey = `cheat_clip_ts_${resultData.video_id}_${durationPref}${modelSuffix}${clipsSuffix}${promptSuffix}${rangeSuffix}${manualSuffix}`;
+          const langSuffix = outputLanguage === 'auto' ? '' : `_lang_${outputLanguage}`;
+          const targetCacheKey = `cheat_clip_cache_${resultData.video_id}_${durationPref}${modelSuffix}${clipsSuffix}${promptSuffix}${rangeSuffix}${manualSuffix}${langSuffix}`;
+          const tsKey = `cheat_clip_ts_${resultData.video_id}_${durationPref}${modelSuffix}${clipsSuffix}${promptSuffix}${rangeSuffix}${manualSuffix}${langSuffix}`;
           localStorage.setItem(targetCacheKey, JSON.stringify(resultData));
           localStorage.setItem(tsKey, new Date().toISOString());
           refreshHistory();
@@ -2766,6 +2777,49 @@ Transcript:
                     💡 {t.form.durAutoTip}
                   </span>
                 )}
+              </div>
+
+              {/* Output Language Selector */}
+              <div style={{ display: 'flex', flexDirection: 'column', gap: '0.5rem' }}>
+                <label style={{ fontSize: '0.875rem', fontWeight: 600, color: 'var(--text-secondary)' }}>{t.form.outputLanguage}</label>
+                <div className="duration-selector" id="output-language-selector-group">
+                  <button
+                    type="button"
+                    className={`duration-btn ${outputLanguage === 'auto' ? 'active' : ''}`}
+                    onClick={() => {
+                      setOutputLanguage('auto');
+                      localStorage.setItem('cheat_clip_output_language', 'auto');
+                    }}
+                    disabled={loading}
+                  >
+                    {t.form.outputLangAuto}
+                  </button>
+                  <button
+                    type="button"
+                    className={`duration-btn ${outputLanguage === 'id' ? 'active' : ''}`}
+                    onClick={() => {
+                      setOutputLanguage('id');
+                      localStorage.setItem('cheat_clip_output_language', 'id');
+                    }}
+                    disabled={loading}
+                  >
+                    {t.form.outputLangId}
+                  </button>
+                  <button
+                    type="button"
+                    className={`duration-btn ${outputLanguage === 'en' ? 'active' : ''}`}
+                    onClick={() => {
+                      setOutputLanguage('en');
+                      localStorage.setItem('cheat_clip_output_language', 'en');
+                    }}
+                    disabled={loading}
+                  >
+                    {t.form.outputLangEn}
+                  </button>
+                </div>
+                <span style={{ fontSize: '0.72rem', color: 'var(--text-muted)', lineHeight: 1.3, marginTop: '0.1rem' }}>
+                  💡 {t.form.outputLangTip}
+                </span>
               </div>
 
               {/* Focus Prompt Search Keyword */}

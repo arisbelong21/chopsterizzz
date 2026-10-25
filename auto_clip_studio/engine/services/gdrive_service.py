@@ -44,6 +44,25 @@ def extract_google_drive_file_id(url: str) -> Optional[str]:
     return None
 
 
+def gdrive_video_id(url_or_id: str, fallback_stem: str = "") -> str:
+    """Stable source identity for a Google Drive video: ``gdrive_<file_id>``.
+
+    Files on disk are stored as ``gdrive_<file_id>_<tag>.mp4``; the random tag
+    only prevents two concurrent downloads from writing the same path. It must
+    never leak into ``video_id`` because the web UI rebuilds the Drive link and
+    the history cache key from that identity, and the tag makes both miss.
+    """
+    file_id = extract_google_drive_file_id(url_or_id)
+    if file_id:
+        return f"gdrive_{file_id}"
+    if fallback_stem.startswith("gdrive_"):
+        # e.g. "gdrive_<id>_<12 hex tag>" -> "gdrive_<id>"
+        stripped = re.sub(r"_[0-9a-fA-F]{12}$", "", fallback_stem)
+        if len(stripped) - len("gdrive_") >= 20:
+            return stripped
+    return fallback_stem
+
+
 def download_google_drive_video(
     url_or_id: str,
     on_progress: Optional[Callable[[str, str, int], None]] = None

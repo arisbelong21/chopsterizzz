@@ -13,6 +13,7 @@ NAV_ITEMS: list[tuple[str, str]] = [
     ("download", "⬇  Download"),
     ("clipper", "✂  Content Clipper AI"),
     ("auto_clip", "✦  Auto Clip Studio"),
+    ("automation", "⇄  Automation"),
     ("history", "🕘  History"),
     ("settings", "⚙  Settings"),
 ]

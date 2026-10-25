@@ -34,6 +34,15 @@ def install_crash_guard() -> Path:
         fh = None
 
     def report(exc_type: type[BaseException], exc: BaseException, tb: Any) -> None:
+        # Ctrl+C / normal interpreter shutdown are user actions, not crashes:
+        # log them quietly instead of showing the "terjadi error" dialog.
+        if isinstance(exc_type, type) and issubclass(exc_type, (KeyboardInterrupt, SystemExit)):
+            try:
+                logging.getLogger("chopster.crash").info(
+                    "Interrupted by user (Ctrl+C) — tidak dihitung sebagai crash.")
+            except Exception:
+                pass
+            return
         text = "".join(traceback.format_exception(exc_type, exc, tb))
         try:
             logger = logging.getLogger("chopster.crash")

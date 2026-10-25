@@ -6,10 +6,12 @@ from PySide6.QtWidgets import QMainWindow, QWidget, QHBoxLayout, QStackedWidget,
 
 from chopster.ui.navigation import Sidebar
 from chopster.ui.theme import stylesheet, THEMES
+from chopster.ui.components.theme_switcher import ThemeSwitcher
 from chopster.ui.pages.dashboard_page import DashboardPage
 from chopster.ui.pages.downloader_page import DownloaderPage
 from chopster.ui.pages.clipper_page import ClipperPage
 from chopster.ui.pages.auto_clip_studio_page import AutoClipStudioPage
+from chopster.ui.pages.automation_page import AutomationPage
 from chopster.ui.pages.history_page import HistoryPage
 from chopster.ui.pages.settings_page import SettingsPage
 
@@ -54,21 +56,46 @@ class MainWindow(QMainWindow):
         self.stack = QStackedWidget(central)
         lay.addWidget(self.stack, 1)
 
-        # pages
-        self.page_dashboard = self._safe_page("Dashboard", lambda: DashboardPage(app, theme, self.stack))
-        if hasattr(self.page_dashboard, "navigate"):
-            self.page_dashboard.navigate.connect(self.navigate)
-        self.page_downloader = self._safe_page("Download", lambda: DownloaderPage(app, theme, self.stack))
-        self.page_clipper = self._safe_page("Content Clipper", lambda: ClipperPage(app, theme, self.stack))
-        self.page_auto_clip = self._safe_page("Auto Clip Studio", lambda: AutoClipStudioPage(app, theme, self.stack))
-        self.page_history = self._safe_page("History", lambda: HistoryPage(app, theme, self.stack))
-        self.page_settings = self._safe_page("Settings", lambda: SettingsPage(app, theme, self.stack))
+        self._build_pages(theme)
+
+        # forward downloader logs? (optional)
+        # restore last workspace
+        last = self.app.config.get("last_workspace") or "dashboard"
+        if last not in self._pages:
+            last = "dashboard"
+        self.navigate(last)
+        self._apply_responsive_layout()
+        self.theme_switcher = ThemeSwitcher(self._theme, central)
+        self.theme_switcher.themeSelected.connect(self._switch_theme)
+        self._place_theme_switcher()
+
+    def _build_pages(self, theme: str) -> None:
+        """Create every page widget, wire cross-page signals and register them."""
+        self.page_dashboard = self._safe_page("Dashboard", lambda: DashboardPage(self.app, theme, self.stack))
+        self.page_downloader = self._safe_page("Download", lambda: DownloaderPage(self.app, theme, self.stack))
+        self.page_clipper = self._safe_page("Content Clipper", lambda: ClipperPage(self.app, theme, self.stack))
+        self.page_auto_clip = self._safe_page("Auto Clip Studio", lambda: AutoClipStudioPage(self.app, theme, self.stack))
+        self.page_automation = self._safe_page("Automation", lambda: AutomationPage(self.app, theme, self.stack))
+        self.page_history = self._safe_page("History", lambda: HistoryPage(self.app, theme, self.stack))
+        self.page_settings = self._safe_page("Settings", lambda: SettingsPage(self.app, theme, self.stack))
+        # Every page may expose a `navigate` signal (sidebar jumps such as
+        # "Download", "Settings", "Automation"). Only the dashboard used to be
+        # wired up, leaving the other pages' nav buttons dead.
+        for _page in (self.page_dashboard, self.page_downloader, self.page_clipper,
+                      self.page_auto_clip, self.page_automation, self.page_history,
+                      self.page_settings):
+            if hasattr(_page, "navigate"):
+                try:
+                    _page.navigate.connect(self.navigate)
+                except Exception:
+                    pass
 
         self._pages = {
             "dashboard": self.page_dashboard,
             "download": self.page_downloader,
             "clipper": self.page_clipper,
             "auto_clip": self.page_auto_clip,
+            "automation": self.page_automation,
             "history": self.page_history,
             "settings": self.page_settings,
         }
@@ -80,13 +107,95 @@ class MainWindow(QMainWindow):
         try: self.page_settings.download_settings_changed.connect(self.page_downloader.refresh_download_settings)
         except Exception: pass
 
-        # forward downloader logs? (optional)
-        # restore last workspace
-        last = self.app.config.get("last_workspace") or "dashboard"
-        if last not in self._pages:
-            last = "dashboard"
-        self.navigate(last)
+    def _is_busy(self) -> bool:
+        """True while a download/render/publish/task is running — theme switch
+        is deferred then so rebuilding the pages cannot kill active work."""
+        busy = bool(getattr(self.page_downloader, "_running", False))
+        try:
+            busy = busy or bool(self.page_auto_clip.has_active_jobs())
+        except Exception:
+            pass
+        try:
+            mgr = getattr(self.app, "automation", None)
+            busy = busy or bool(mgr and getattr(mgr.runner, "active_count", 0) > 0)
+        except Exception:
+            pass
+        try:
+            busy = busy or bool(self.app.tasks and self.app.tasks.has_active_tasks())
+        except Exception:
+            pass
+        return busy
+
+    def _switch_theme(self, theme: str) -> None:
+        if theme not in THEMES:
+            return
+        if theme == self._theme:
+            self.theme_switcher.set_theme(self._theme)
+            return
+        if self._is_busy():
+            QMessageBox.information(
+                self, "Ganti tema",
+                "Selesaikan proses yang sedang berjalan (download/render/publish) dulu, lalu ganti tema lagi.",
+            )
+            self.theme_switcher.set_theme(self._theme)
+            return
+        try:
+            self.app.config.set("theme", theme)
+        except Exception:
+            pass
+        self._theme = theme
+        self.setStyleSheet(stylesheet(theme))
+        self._rebuild_ui()
+        self.theme_switcher.set_theme(theme)
+
+    def _rebuild_ui(self) -> None:
+        """Recreate sidebar + pages under a new theme while keeping the
+        current workspace open. The shared ACS runtime stays alive; the old
+        Automation page removes its manager listener with shutdown()."""
+        current = next((k for k, w in self._pages.items() if self.stack.currentWidget() is w), "dashboard")
+        try:
+            if hasattr(self.page_automation, "shutdown"):
+                self.page_automation.shutdown()
+        except Exception:
+            pass
+        for w in self._pages.values():
+            try:
+                w.setParent(None)
+            except Exception:
+                pass
+            w.deleteLater()
+        lay = self.centralWidget().layout()
+        try:
+            self.sidebar.navigate.disconnect(self.navigate)
+        except Exception:
+            pass
+        lay.removeWidget(self.sidebar)
+        self.sidebar.deleteLater()
+        new_sidebar = Sidebar(self._theme, self.centralWidget())
+        new_sidebar.navigate.connect(self.navigate)
+        lay.insertWidget(0, new_sidebar)
+        self.sidebar = new_sidebar
+        self._build_pages(self._theme)
+        if current not in self._pages:
+            current = "dashboard"
+        self.navigate(current)
         self._apply_responsive_layout()
+        self._place_theme_switcher()
+
+    def _place_theme_switcher(self) -> None:
+        """Anchor the switcher pill top-centre so it never covers the page's
+        own top-right header buttons (Create Automation, Buka Automation…)."""
+        sw = getattr(self, "theme_switcher", None)
+        if sw is None:
+            return
+        try:
+            sw.adjustSize()
+            cw = self.centralWidget()
+            x = max(0, (cw.width() - sw.width()) // 2)
+            sw.setGeometry(x, 12, sw.width(), sw.height())
+            sw.raise_()
+        except Exception:
+            pass
 
     def _safe_page(self, name, factory):
         try:
@@ -109,7 +218,7 @@ class MainWindow(QMainWindow):
         except Exception: pass
 
     def resizeEvent(self,event):
-        super().resizeEvent(event); self._apply_responsive_layout()
+        super().resizeEvent(event); self._apply_responsive_layout(); self._place_theme_switcher()
 
     def navigate(self, key: str) -> None:
         if key not in self._pages:
@@ -130,6 +239,9 @@ class MainWindow(QMainWindow):
             except Exception: pass
         elif key == "clipper":
             try: self.page_clipper.refresh_ai_status()
+            except Exception: pass
+        elif key == "automation":
+            try: self.page_automation.refresh_all()
             except Exception: pass
 
     def receive_external_url(self, url: str) -> None:
@@ -185,6 +297,17 @@ class MainWindow(QMainWindow):
             if ret != QMessageBox.Yes:
                 event.ignore()
                 return
+        automation_busy = False
+        try:
+            mgr = getattr(self.app, "automation", None)
+            automation_busy = bool(mgr and mgr.runner.active_count > 0)
+        except Exception:
+            automation_busy = False
+        if automation_busy:
+            ret = QMessageBox.question(self, "Keluar", "Automation sedang mengupload/menerbitkan. Batalkan job yang berjalan dan keluar?", QMessageBox.Yes | QMessageBox.No)
+            if ret != QMessageBox.Yes:
+                event.ignore()
+                return
         if self.app.tasks.has_active_tasks() and not getattr(self.page_downloader, "_running", False):
             ret = QMessageBox.question(self, "Keluar", "Tugas masih berjalan. Batalkan tugas dan keluar setelah proses berhenti?", QMessageBox.Yes | QMessageBox.No)
             if ret != QMessageBox.Yes:
@@ -193,6 +316,11 @@ class MainWindow(QMainWindow):
         try:
             if hasattr(self.page_auto_clip, "shutdown"):
                 self.page_auto_clip.shutdown()
+        except Exception:
+            pass
+        try:
+            if hasattr(self.page_automation, "shutdown"):
+                self.page_automation.shutdown()
         except Exception:
             pass
         self.app.tasks.begin_shutdown()
