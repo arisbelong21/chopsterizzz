@@ -510,33 +510,85 @@ def transcript_cache_key(path: str | Path, model: str, language: str, word_times
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:32]
 
 
+_CONTENT_SAMPLE_BYTES = 1024 * 1024
+
+
+def content_signature(path: str | Path) -> str:
+    """Content identity of a media file, independent of where it lives.
+
+    Re-downloading a YouTube video writes a new file (new mtime, possibly a new
+    name), which used to invalidate the path based cache and force a full
+    retranscription. Sampling three 1 MiB chunks keeps this cheap even for a
+    multi-gigabyte file.
+    """
+    p = Path(path)
+    size = p.stat().st_size
+    digest = hashlib.sha256()
+    with p.open("rb") as fh:
+        if size <= _CONTENT_SAMPLE_BYTES * 3:
+            digest.update(fh.read())
+        else:
+            for pos in (0, max(0, size // 2 - _CONTENT_SAMPLE_BYTES // 2), max(0, size - _CONTENT_SAMPLE_BYTES)):
+                fh.seek(pos)
+                digest.update(fh.read(_CONTENT_SAMPLE_BYTES))
+    return hashlib.sha256(f"{size}|{digest.hexdigest()}".encode()).hexdigest()[:32]
+
+
+def content_cache_path(path: str | Path, model: str, language: str, word_timestamps: bool) -> Path:
+    d = user_data_dir() / "cache" / "transcripts"
+    d.mkdir(parents=True, exist_ok=True)
+    payload = f"{content_signature(path)}|{model}|{language}|{int(bool(word_timestamps))}"
+    return d / f"content-{hashlib.sha256(payload.encode('utf-8')).hexdigest()[:32]}.json"
+
+
 def transcript_cache_path(path: str | Path, model: str, language: str, word_timestamps: bool) -> Path:
     d = user_data_dir() / "cache" / "transcripts"
     d.mkdir(parents=True, exist_ok=True)
     return d / f"{transcript_cache_key(path, model, language, word_timestamps)}.json"
 
 
+def _read_transcript_cache(cache: Path) -> Transcript | None:
+    if not cache.exists():
+        return None
+    return _base_transcript_copy(Transcript.from_dict(json.loads(cache.read_text(encoding="utf-8"))))
+
+
 def load_cached_transcript(path: str | Path, model: str, language: str, word_timestamps: bool) -> Transcript | None:
     try:
-        cache = transcript_cache_path(path, model, language, word_timestamps)
-        if not cache.exists():
-            return None
-        return _base_transcript_copy(Transcript.from_dict(json.loads(cache.read_text(encoding="utf-8"))))
+        cached = _read_transcript_cache(transcript_cache_path(path, model, language, word_timestamps))
+        if cached is not None:
+            return cached
+    except Exception:
+        pass
+    # Fall back to the content based entry: same video, different file/copy.
+    try:
+        return _read_transcript_cache(content_cache_path(path, model, language, word_timestamps))
     except Exception:
         return None
 
 
 def save_cached_transcript(path: str | Path, model: str, language: str, word_timestamps: bool, transcript: Transcript) -> Path:
-    cache = transcript_cache_path(path, model, language, word_timestamps)
-    cache.write_text(json.dumps(_base_transcript_copy(transcript).to_dict(), ensure_ascii=False), encoding="utf-8")
+    """Store the raw transcript under a content based key.
+
+    Content keys survive re-downloads and copies, so the expensive Whisper pass is
+    paid once per video content instead of once per file path.
+    """
+    payload = json.dumps(_base_transcript_copy(transcript).to_dict(), ensure_ascii=False)
+    cache = content_cache_path(path, model, language, word_timestamps)
+    tmp = cache.with_suffix(".json.tmp")
+    tmp.write_text(payload, encoding="utf-8")
+    tmp.replace(cache)
     return cache
 
 
 def delete_cached_transcript(path: str | Path, model: str, language: str, word_timestamps: bool) -> bool:
     """Delete exactly one transcription cache entry for the selected source/settings."""
-    cache = transcript_cache_path(path, model, language, word_timestamps)
-    try:
-        cache.unlink(missing_ok=True)
-        return True
-    except Exception:
-        return False
+    deleted = False
+    for builder in (transcript_cache_path, content_cache_path):
+        try:
+            cache = builder(path, model, language, word_timestamps)
+            cache.unlink(missing_ok=True)
+            deleted = True
+        except Exception:
+            pass
+    return deleted

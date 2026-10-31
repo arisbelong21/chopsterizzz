@@ -174,15 +174,16 @@ def test_select_titles_keeps_different_angles_and_drops_clickbait():
          "specificity": 2, "curiosity": 10, "clarity": 6, "honesty": 2},
     ]}
     picked = select_titles(candidates, scored, count=3)
-    assert "RAHASIA YANG SEMUA ORANG SEMBUNYIKAN" not in picked, "clickbait must not ship"
-    assert picked == ["GOL PENALTI DETIK AKHIR", "KENAPA KIPER TIDAK SIAP",
-                      "3 KESALAHAN KIPER"], picked
+    assert not any(t.lower() == "rahasia yang semua orang sembunyikan"
+                   for t in picked), "clickbait must not ship"
+    assert picked == ["Gol Penalti Detik Akhir", "Kenapa Kiper Tidak Siap",
+                      "3 Kesalahan Kiper"], picked
     # The runner-up of an already-used angle loses to a lower scoring new angle.
-    assert "GOL PENALTI DETIK TERAKHIR" not in picked, picked
+    assert "Gol Penalti Detik Terakhir" not in picked, picked
 
     # A title another video already used never comes back.
     avoided = select_titles(candidates, scored, avoid_titles=["GOL PENALTI DETIK AKHIR"], count=3)
-    assert "GOL PENALTI DETIK AKHIR" not in avoided, avoided
+    assert "Gol Penalti Detik Akhir" not in avoided, avoided
 
     # A silent critic keeps the brainstorm pool instead of an empty list.
     fallback = select_titles(candidates, {}, count=2)
@@ -203,7 +204,9 @@ def test_house_style_trims_a_title_that_outruns_the_phone_cut(monkeypatch):
     })
     pack, _orch = _run(monkeypatch, {"ai_title_two_stage": False}, [reply])
     assert len(pack["title"]) <= TITLE_MAX_CHARS, pack["title"]
-    assert pack["title"] == pack["title"].upper()
+    # The phone cut keeps human casing instead of shouting the remainder.
+    assert pack["title"].startswith("Penalti Detik Akhir"), pack["title"]
+    assert not pack["title"].isupper(), pack["title"]
 
 
 # ------------------------------------------------------------------ two stages
@@ -218,12 +221,12 @@ def test_two_stage_pass_promotes_the_critics_winner(monkeypatch):
     # Stage 2 sees the brainstormed candidates.
     assert "KIPER SALAH ANTISIPASI ARAH BOLA" in orch.prompts[2], orch.prompts[2]
 
-    assert pack["title"] == "PENALTI DETIK AKHIR PECAHKAN STADION", pack["title"]
+    assert pack["title"] == "Penalti Detik Akhir Pecahkan Stadion", pack["title"]
     assert pack["titles"][0] == pack["title"], pack["titles"]
     assert pack["title_source"] == "brainstorm-critic", pack
     assert pack["title_angles"][0] == "cerita/pengalaman", pack["title_angles"]
     # The single-shot titles stay visible as the remaining options.
-    assert "PENALTI DETIK AKHIR" in pack["titles"], pack["titles"]
+    assert "Penalti Detik Akhir" in pack["titles"], pack["titles"]
     assert len(set(pack["titles"])) == len(pack["titles"]), pack["titles"]
 
 
@@ -232,7 +235,7 @@ def test_two_stage_failure_keeps_the_single_shot_titles(monkeypatch):
     pack, orch = _run(monkeypatch, {"ai_title_two_stage": True},
                       [_PACK_REPLY, "bukan json sama sekali", "{}"])
     assert len(orch.prompts) == 2, "the pass stops after the unusable brainstorm"
-    assert pack["title"] == "PENALTI DETIK AKHIR", pack["title"]
+    assert pack["title"] == "Penalti Detik Akhir", pack["title"]
     assert "title_source" not in pack, pack
 
 

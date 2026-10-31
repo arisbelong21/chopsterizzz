@@ -22,6 +22,29 @@ RENDER_BATCHES: Dict[str, Dict[str, Any]] = {}
 BATCH_REQUESTS: Dict[str, RenderBatchRequest] = {}
 
 
+def resolve_clip_language(preference: Optional[str], lines: List[Dict[str, Any]],
+                          title: str = "") -> str:
+    """Return the REAL spoken-language code for a clip.
+
+    ``preference`` is the user's output-language choice ("auto"/"id"/"en"/…).
+    A concrete language is honoured verbatim. When it is "auto" (or empty) the
+    language is detected from the clip's own transcript, so the value stored in
+    ClipContext is an actual code (e.g. "en") and never the literal "auto".
+    Downstream template publish set to "follow the video language" then writes
+    metadata in the video's real language instead of defaulting to Indonesian.
+    """
+    pref = str(preference or "").strip().lower()
+    if pref and pref not in ("auto", "automatic", "detect", "autodetect", "none", "default"):
+        return pref
+    try:
+        from chopster.auto_clip_studio.engine.utils import detect_transcript_language
+        detected = detect_transcript_language(lines or [], title or "")
+    except Exception:
+        return "auto"
+    code = str((detected or {}).get("code") or "").strip().lower()
+    return code or "auto"
+
+
 async def render_single_batch_clip(
     batch_id: str,
     idx: int,
@@ -124,8 +147,8 @@ async def render_single_batch_clip(
                 logger.warning(f"Could not render color emoji title overlay: {ex}")
                 skip_ass_title = False
 
+        words: List[Dict[str, Any]] = []
         if settings.caption_style != "none" or (display_title and settings.title_position != "none" and not skip_ass_title):
-            words = []
             if settings.caption_style != "none":
                 words = await asyncio.to_thread(
                     transcribe_clip_words,
@@ -221,19 +244,27 @@ async def render_single_batch_clip(
                 if not lines and isinstance(transcript, list) and transcript:
                     lines = transcript
                 if lines:
+                    base_title_str = str(clip_status.get("base_title") or "")
+                    ctx_language = resolve_clip_language(language, lines, base_title_str)
                     ctx = build_clip_context(
                         source="acs",
                         source_asset_id=f"{batch_id}:{idx}",
                         project_id=str(batch.get("project_id") or "") if isinstance(batch, dict) else "",
                         media_path=out_path,
-                        title=str(clip_status.get("base_title") or ""),
-                        # Propagate the analysis output language so downstream AI caption/hook
-                        # generation keeps the video's real language instead of defaulting to "id".
-                        language=(language or "auto"),
+                        title=base_title_str,
+                        # Store the clip's REAL spoken language (a concrete code,
+                        # never the literal "auto") so template publish set to
+                        # "follow the video language" writes metadata in the right
+                        # language instead of defaulting to Indonesian.
+                        language=ctx_language,
                         clip_start=0.0,
                         clip_end=round(float(duration_sec), 3),
                         segments=lines,
                         evidence="transcript yang dianalisis Auto Clip Studio untuk clip ini",
+                        # Keep the analysis AI's own grounded copy so publish can
+                        # offer it as a candidate instead of throwing it away.
+                        ai_title_suggestion=str(clip.get("title_suggestion") or ""),
+                        ai_caption_suggestion=str(clip.get("caption_suggestion") or ""),
                     )
                     clip_context = ctx.to_dict()
             except Exception:

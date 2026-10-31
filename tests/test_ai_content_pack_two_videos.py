@@ -38,10 +38,13 @@ _STOPWORD_TAGS = ("#yang", "#dengan", "#untuk", "#dari", "#video", "#bagian")
 
 
 def _assert_house_style(pack: dict) -> None:
-    """CAPSLOCK titles, CTA in every caption, natural hashtags."""
+    """Natural creator titles, CTA in every caption, natural hashtags."""
     assert pack["titles"], "a pack must carry a usable title"
     for title in pack["titles"]:
-        assert title == title.upper(), title
+        # Human casing, not a CAPSLOCK shout (the bot look content-reward
+        # providers reject). A single-word acronym may stay uppercase.
+        assert title == title.strip() and not title.endswith("."), title
+        assert not title.isupper() or len(title.split()) == 1, title
         assert not is_technical_title(title), title
     for field in ("description_short", "description_long", "captions"):
         values = pack.get(field)
@@ -225,10 +228,10 @@ def test_second_video_prompt_carries_first_videos_metadata(monkeypatch):
     # But the first request starts clean — nothing to avoid yet.
     assert "judul yang sudah dipakai" not in prompt_a
 
-    # The AI's own words are kept — the technical label is never the title — but
-    # they are rendered in the house style (CAPSLOCK) before publishing.
-    assert a["title"] == "GOL PENALTI DETIK AKHIR YANG PECAHKAN STADION"
-    assert b["title"] == "MURID YANG BERANI MELAWAN ATURAN SEKOLAH"
+    # The AI's own words are kept — the technical label is never the title — in
+    # natural creator casing before publishing.
+    assert a["title"] == "Gol Penalti Detik Akhir yang Pecahkan Stadion"
+    assert b["title"] == "Murid yang Berani Melawan Aturan Sekolah"
     assert not is_technical_title(a["title"]) and not is_technical_title(b["title"])
     _assert_house_style(a)
     _assert_house_style(b)
@@ -238,15 +241,15 @@ def test_second_video_prompt_carries_first_videos_metadata(monkeypatch):
 
 
 def test_house_style_holds_even_when_the_ai_ignores_the_prompt(monkeypatch):
-    """A Title-Case answer from the model still ships as a CAPSLOCK, CTA-ready pack.
+    """A CAPSLOCK answer from the model still ships in natural creator casing.
 
-    The prompt asks for capslock titles, a hook + CTA and natural hashtags, but
-    the Studio must not *depend* on the model obeying: every pack is normalised
-    before it can reach the publish queue.
+    The prompt asks for human-style titles, a hook + CTA and natural hashtags,
+    but the Studio must not *depend* on the model obeying: every pack is
+    normalised before it can reach the publish queue.
     """
     replies = [
         json.dumps({
-            "titles": ["00:15 - 00:45", "Penalti Detik Akhir yang Pecahkan Stadion"],
+            "titles": ["00:15 - 00:45", "PENALTI DETIK AKHIR YANG PECAHKAN STADION"],
             "captions": ["Stadion pecah oleh gol penalti di detik akhir."],
             "description_short": "Gol penalti di detik akhir mengubah segalanya.",
             "description_long": "Rekap gol penalti dramatis dan penyelamatan kiper.",
@@ -257,8 +260,9 @@ def test_house_style_holds_even_when_the_ai_ignores_the_prompt(monkeypatch):
     orch = _RecordingOrchestrator(replies)
     pack = _run_batch([_ctx_bola()], monkeypatch, orchestrator=orch)[0]
 
-    # The echoed renderer label is dropped, the AI's words stay (in CAPSLOCK).
-    assert pack["title"].startswith("PENALTI DETIK AKHIR"), pack["title"]
+    # The echoed renderer label is dropped; the shout is converted to the way a
+    # creator writes it (small word "yang" stays lowercase).
+    assert pack["title"] == "Penalti Detik Akhir yang Pecahkan Stadion", pack["title"]
     for title in pack["titles"]:
         assert title != "00:15 - 00:45", title
     assert pack["thumbnail_text"] == ["GOL PENALTI"]

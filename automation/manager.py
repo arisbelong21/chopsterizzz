@@ -12,7 +12,7 @@ from typing import Any, Callable
 from chopster.automation import events as bus
 from chopster.automation.auth import AuthManager
 from chopster.automation.autopilot import AutoPilotEngine
-from chopster.automation.content import normalize_content_pack
+from chopster.automation.content import normalize_content_pack, primary_platform
 from chopster.automation.models import (
     AutomationError, DELETABLE_JOB_STATUSES, DuplicateInQueueError, JobStatus, PLATFORMS,
     RunStatus, derive_run_status, new_id, now_iso,
@@ -966,7 +966,8 @@ class AutomationManager:
                         and isinstance(ctx.get("segments"), list) and ctx.get("segments")):
                     try:
                         pack = self._generate_template_pack(
-                            dict(m), cfg_base, language=ai_language)
+                            dict(m), cfg_base, language=ai_language,
+                            platform=primary_platform(platforms))
                     except Exception as exc:
                         try:
                             self.app.logger.warning(
@@ -1049,7 +1050,14 @@ class AutomationManager:
         return " · ".join(parts)
 
     def _template_ai_config(self) -> dict[str, Any]:
-        """AI settings for background pack generation (page-free replica)."""
+        """AI settings for background pack generation (page-free replica).
+
+        The one-click template publish must never silently drop to the rigid
+        local fallback just because the *global* Settings AI is off. Auto Clip
+        Studio keeps its own Gemini key (and can borrow a vision-verified global
+        provider), so when the global text AI is not usable we resolve that
+        ACS-specific source and route the pack generation through it instead.
+        """
         cfg: dict[str, Any] = {}
         try:
             cfg = dict(self.app.config.as_dict() or {})
@@ -1066,11 +1074,73 @@ class AutomationManager:
         cfg["ai_timeout"] = int(self.app.config.get("ai_timeout") or 90)
         cfg["ai_temperature"] = float(self.app.config.get("ai_temperature") or 0.2)
         cfg["ai_instruction"] = ""
+        self._apply_acs_ai_fallback(cfg)
         return cfg
+
+    def _apply_acs_ai_fallback(self, cfg: dict[str, Any]) -> None:
+        """Point ``cfg`` at the ACS-specific AI when the global AI is unusable.
+
+        Mutates ``cfg`` in place. Priority mirrors Auto Clip Studio's own
+        analysis (see ``global_ai.resolve_ai_source``): the ACS Gemini key wins,
+        then a vision-verified global Google key, then a global Gateway. A usable
+        global text AI is left untouched so existing behaviour never changes.
+        """
+        try:
+            from chopster.ai import config_helpers
+        except Exception:
+            return
+        provider = config_helpers.normalize_provider(cfg.get("ai_provider"))
+        endpoint = str(cfg.get("ai_endpoint") or "").strip()
+        api_key = str(cfg.get("ai_api_key") or "").strip()
+        if config_helpers.settings_ai_enabled(provider, endpoint, api_key):
+            return
+        try:
+            from chopster.auto_clip_studio.engine.global_ai import resolve_ai_source
+            resolved = resolve_ai_source()
+        except Exception:
+            return
+        source = str(resolved.get("source") or "")
+        gemini_key = str(resolved.get("gemini_key") or "").strip()
+        gateway = resolved.get("gateway") if isinstance(resolved.get("gateway"), dict) else None
+        if source in ("acs", "google_global") and gemini_key:
+            # GoogleGeminiProvider defaults to gemini-2.5-flash when model is
+            # blank; the global ai_model may name a gateway model, so clear it.
+            cfg["ai_provider"] = config_helpers.PROVIDER_GOOGLE
+            cfg["ai_api_key"] = gemini_key
+            cfg["ai_endpoint"] = ""
+            cfg["ai_model"] = ""
+            cfg["ai_vision_model"] = ""
+            try:
+                self.app.logger.info(
+                    "[Automation][template] AI global mati — pakai AI khusus ACS (%s)", source)
+            except Exception:
+                pass
+        elif source == "gateway" and gateway:
+            cfg["ai_provider"] = config_helpers.PROVIDER_GATEWAY
+            cfg["ai_endpoint"] = str(gateway.get("endpoint") or "")
+            cfg["ai_api_key"] = str(gateway.get("api_key") or "")
+            cfg["ai_model"] = str(gateway.get("model") or "")
+            cfg["ai_vision_model"] = str(gateway.get("vision_model") or cfg["ai_model"])
+            cfg["ai_timeout"] = int(gateway.get("timeout") or cfg.get("ai_timeout") or 90)
+            try:
+                self.app.logger.info("[Automation][template] AI global mati — pakai Gateway ACS")
+            except Exception:
+                pass
+
+    def _detect_context_language(self, ctx: Any) -> str:
+        """Detect a clip's spoken language from its own transcript segments.
+
+        Returns a concrete ISO code (e.g. "en") or "auto" when there is no usable
+        evidence. Safety net for "follow the video language" publish on clips
+        whose stored ``ClipContext.language`` is still the literal "auto".
+        """
+        from chopster.automation.context import detect_context_language
+        return detect_context_language(ctx)
 
     def _generate_template_pack(self, media_row: dict[str, Any],
                                 cfg_base: dict[str, Any],
-                                language: str = "id") -> dict[str, Any]:
+                                language: str = "id",
+                                platform: str = "youtube") -> dict[str, Any]:
         """One AI Content Pack per ready ACS clip — same evidence rules as the
         Automation Create tab, without any page dependency."""
         from copy import deepcopy
@@ -1101,20 +1171,14 @@ class AutomationManager:
         cfg2["working_title"] = name
         # Title/description/hashtag language: template choice, or the clip's own
         # language when the template asks to follow the video.
-        lang = str(language or "id").strip().lower() or "id"
-        if lang in ("auto", "video", "follow"):
-            lang = str(getattr(ctx, "language", "") or "").strip().lower()
-            if not lang or lang == "auto":
-                from chopster.automation.context import focused_transcript as _ft
-                focus_hint = _ft(ctx)
-                lang = str(getattr(focus_hint, "language", "") or "").strip().lower()
-            if not lang or lang == "auto":
-                lang = "id"
+        from chopster.automation.context import resolve_pack_language
+        lang = resolve_pack_language(ctx, language or "auto")
         focus = focused_transcript(ctx)
         if focus is None or not focus.segments:
             return self._fallback_pack(name, ctx.excerpt, "transkrip kosong")
+        plat = str(platform or "youtube").strip().lower() or "youtube"
         try:
-            pack = generate_captions(focus, cfg2, platform="youtube",
+            pack = generate_captions(focus, cfg2, platform=plat,
                                      language=lang, count=5, style="hooks")
         except Exception as exc:
             # AI provider down/quota/offline: publish with a text fallback
@@ -1214,7 +1278,8 @@ class AutomationManager:
                 if status_cb is not None:
                     status_cb(f"Generate AI judul/deskripsi/hashtag ({i}/{len(chosen)}): {name}…")
                 _log(f"pack {i}/{len(chosen)}: {name}")
-                pack = self._generate_template_pack(row, cfg_base, language=ai_language)
+                pack = self._generate_template_pack(row, cfg_base, language=ai_language,
+                                                    platform=primary_platform(platforms))
                 media_items.append({"path": path, "title": name,
                                     "clip_id": str(row.get("clip_id") or ""),
                                     "content": pack})

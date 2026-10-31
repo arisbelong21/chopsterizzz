@@ -124,21 +124,21 @@ def analyze_frames(image_paths: list[str], prompt: str = "") -> dict[str, Any]:
     }
 
 
-#: Content-pack house style for the offline provider: CAPSLOCK titles, a hook +
-#: CTA in every description, and hashtags taken from the transcript itself
-#: instead of a generic list (the "kelihatan bot" Studio complaint).
+#: Content-pack house style for the offline provider: natural creator titles, a
+#: hook + CTA in every description, and hashtags taken from the transcript
+#: itself instead of a generic list (the "kelihatan bot" Studio complaint).
 _PACK_TITLE_SHAPES = {
     "id": (
-        "{topic}: YANG BIKIN BERHENTI SCROLL",
-        "KENAPA {topic} JADI BAHAN PERHATIAN?",
-        "{topic} - BAGIAN YANG JARANG DIBAHAS",
-        "INI YANG TERJADI SAAT {topic} DIBAHAS",
+        "{topic}: bagian yang bikin berhenti scroll",
+        "Kenapa {topic} jadi bahan perhatian?",
+        "{topic} - bagian yang jarang dibahas",
+        "Ini yang terjadi saat {topic} dibahas",
     ),
     "en": (
-        "{topic}: THE PART THAT STOPS THE SCROLL",
-        "WHY {topic} GOT EVERYONE'S ATTENTION",
-        "{topic} - THE PART NOBODY TALKS ABOUT",
-        "WHAT HAPPENS WHEN {topic} GETS DISCUSSED",
+        "{topic}: the part that stops your scroll",
+        "Why {topic} gets everyone's attention",
+        "{topic} - the part nobody talks about",
+        "What happens when {topic} gets discussed",
     ),
 }
 _PACK_CTAS = {
@@ -168,8 +168,13 @@ _PACK_TRANSCRIPT_RE = re.compile(r"Transkrip/konteks:\s*(.*)", re.S | re.IGNOREC
 #: The prompt's own JSON-format block follows the transcript and must never be
 #: mined for keywords ("#json", "#description_long" is the bot smell).
 _PACK_TAIL_RE = re.compile(r"\n\s*Format JSON:.*", re.S | re.IGNORECASE)
-#: The caption prompt declares the output language on a "Bahasa: xx" line.
-_PACK_LANG_RE = re.compile(r"Bahasa:\s*([A-Za-z-]+)", re.IGNORECASE)
+#: The caption prompt declares the output language on a "Bahasa output: xx" line,
+#: sometimes as a code ("en") and sometimes as a name ("Inggris (English)").
+_PACK_LANG_RE = re.compile(r"Bahasa(?:\s+output)?:\s*([A-Za-z-]+)", re.IGNORECASE)
+_PACK_LANG_ALIASES = {
+    "id": "id", "indonesia": "id", "indonesian": "id",
+    "en": "en", "inggris": "en", "english": "en",
+}
 _PACK_EN_MARKERS = frozenset({
     "the", "and", "you", "your", "this", "that", "with", "what", "when", "why",
     "how", "who", "are", "were", "have", "has", "had", "will", "would", "could",
@@ -202,13 +207,15 @@ def _pack_sentence(text: str, limit: int) -> str:
 def _detect_pack_language(prompt: str, body: str) -> str:
     """Resolve the pack's output language ('id' or 'en').
 
-    Order of evidence: the prompt's explicit "Bahasa: xx" line wins; otherwise a light
-    stopword scan of the transcript body picks the dominant language, defaulting to 'id'
-    (Chopster's house default) only when the evidence is genuinely mixed or empty.
+    Order of evidence: the prompt's explicit "Bahasa output: xx" line wins (code
+    or name); otherwise a light stopword scan of the transcript body picks the
+    dominant language, defaulting to 'id' (Chopster's house default) only when
+    the evidence is genuinely mixed or empty.
     """
     m = _PACK_LANG_RE.search(prompt or "")
     if m:
         code = (m.group(1) or "").strip().lower().split("-")[0]
+        code = _PACK_LANG_ALIASES.get(code, code)
         if code in ("en", "id"):
             return code
     tokens = re.findall(r"\b[a-z]+\b", (body or "").lower())
@@ -238,7 +245,19 @@ def _pack_json(prompt: str) -> dict[str, Any]:
         freq[word] = freq.get(word, 0) + 1
     top = sorted(freq, key=lambda key: (-freq[key], key))[:8]
     default_topic = "video ini" if lang == "id" else "this video"
-    topic = _pack_caps(" ".join(top[:3]) or body[:60] or default_topic, 48)
+    # Reuse the pack's own casing/extraction rules (acronyms kept, small words
+    # lowered, clause cut at a clean phrase) so the offline provider writes
+    # titles the same natural way the AI path does.
+    from chopster.clipper.caption_generator import (
+        _human_title,
+        _lower_leading_article,
+        _title_case_human,
+        _topic_phrase,
+    )
+    topic_raw = (_topic_phrase(body, 48) or " ".join(top[:3]) or body[:60]
+                 or default_topic)
+    topic = _human_title(_title_case_human(topic_raw), 48) or default_topic
+    topic_mid = _lower_leading_article(topic)
     hook_fallback = (
         f"Bagian ini membahas {topic.lower()}." if lang == "id"
         else f"This part covers {topic.lower()}."
@@ -276,8 +295,9 @@ def _pack_json(prompt: str) -> dict[str, Any]:
         thumbs = ["THIS PART", "WHAT DO YOU THINK?", "THIS PART MATTERS", "LISTEN TO THE END"]
         hashtags_default = "#shorts"
     return {
-        "titles": [_pack_caps(title_shapes[i % len(title_shapes)].format(topic=topic), 100)
-                   for i in range(3)],
+        "titles": [_human_title(_title_case_human(
+            title_shapes[i % len(title_shapes)].format(topic=topic_mid)), 100)
+            for i in range(3)],
         "captions": captions,
         "description_short": f"{hook} Fokusnya {details}. {cta}" if lang == "id" else f"{hook} It focuses on {details}. {cta}",
         "description_long": description_long,

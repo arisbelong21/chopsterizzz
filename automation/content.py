@@ -20,6 +20,27 @@ YT_DESCRIPTION_LIMIT = 5000
 YT_TAG_TOTAL_LIMIT = 480
 
 
+def primary_platform(platforms: Any) -> str:
+    """The platform a shared content pack should be written for.
+
+    One pack is generated per video and reused on every target platform, so it
+    is written for the most demanding target: YouTube when it is selected (long
+    description + chapters), otherwise the first selected platform. Accepts
+    ``["youtube", ...]`` or ``[{"platform": "youtube"}, ...]``.
+    """
+    names: list[str] = []
+    for entry in platforms if isinstance(platforms, (list, tuple)) else []:
+        if isinstance(entry, dict):
+            name = str(entry.get("platform") or "").strip().lower()
+        else:
+            name = str(entry or "").strip().lower()
+        if name in PLATFORMS and name not in names:
+            names.append(name)
+    if not names:
+        return "youtube"
+    return "youtube" if "youtube" in names else names[0]
+
+
 def _as_list(value: Any) -> list[str]:
     if isinstance(value, list):
         return [str(v).strip() for v in value if str(v).strip()]

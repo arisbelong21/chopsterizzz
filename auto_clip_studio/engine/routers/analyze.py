@@ -41,6 +41,12 @@ from chopster.auto_clip_studio.engine.services.gdrive_service import (
     gdrive_video_id,
     is_google_drive_url,
 )
+from chopster.auto_clip_studio.engine.services.transcript_cache import (
+    get_cached_transcript,
+    save_cached_transcript,
+    subject_for_file,
+    subject_for_video,
+)
 from chopster.auto_clip_studio.engine.services.youtube_service import (
     fetch_transcript,
     fetch_video_metadata,
@@ -435,6 +441,13 @@ async def analyze_video(request: AnalyzeRequest):
         # video's own spoken language); any ISO code forces titles, hooks, captions, hashtags
         # and the Whisper spoken-language hint to that language.
         language_override = resolve_language_override(request.language)
+        # Transcript cache scope: one entry per (video/file, requested language).
+        # "auto" (no explicit override) is a single bucket, because the pipeline may
+        # return any language for auto-detect and re-keying it by the detected code
+        # would create duplicate entries for the same run settings.
+        cache_lang = (language_override or {}).get("code") or ""
+        cache_subject = ""
+        transcript_source = "subtitles"
         is_uploaded = False
         is_gdrive = is_google_drive_url(req_clean)
         uploaded_file_path: Optional[Path] = None
@@ -513,6 +526,10 @@ async def analyze_video(request: AnalyzeRequest):
             canonical_url = req_clean if is_gdrive else f"/api/video/{uploaded_file_path.name}"
             video_url = f"/api/video/{uploaded_file_path.name}"
             source_type = "gdrive" if is_gdrive else "upload"
+            cache_subject = subject_for_file(
+                uploaded_file_path,
+                video_id=video_id if is_gdrive else "",
+            )
 
             yield _sse({
                 "step": 1,
@@ -578,7 +595,26 @@ async def analyze_video(request: AnalyzeRequest):
                 })
 
             # ── Step 3: Speech Recognition via Whisper AI ───────────────────
-            if request.subtitles:
+            # Manual subtitles always win and are never cached (they are a one-off
+            # user supplied script). Otherwise reuse a stored transcript so a repeat
+            # run of the same file skips minutes of Whisper work.
+            cached_lines = None if request.subtitles else get_cached_transcript(cache_subject, cache_lang)
+            if cached_lines:
+                transcript_lines = cached_lines
+                transcript_source = "cache"
+                logger.info(
+                    f"Transcript cache hit for {cache_subject} (lang={cache_lang or 'auto'}): "
+                    f"{len(cached_lines)} lines — Whisper skipped"
+                )
+                yield _sse({
+                    "step": 3,
+                    "step_progress": 100,
+                    "overall_progress": 70,
+                    "stage": "Subtitles Ready",
+                    "detail": f"Transcript cache ditemukan — {len(cached_lines)} baris dipakai ulang, Whisper dilewati.",
+                    "message": f"Transcript dari cache — {len(cached_lines)} baris siap, tanpa transkripsi ulang."
+                })
+            elif request.subtitles:
                 yield _sse({
                     "step": 3,
                     "step_progress": 30,
@@ -645,6 +681,8 @@ async def analyze_video(request: AnalyzeRequest):
                         yield _sse(progress_queue.get_nowait())
 
                     transcript_lines = await task
+                    if transcript_lines:
+                        transcript_source = "whisper"
                     if not transcript_lines:
                         if is_mock:
                             transcript_lines = [
@@ -690,6 +728,7 @@ async def analyze_video(request: AnalyzeRequest):
                 video_id = "dQw4w9WgXcQ"
 
             canonical_url = f"https://www.youtube.com/watch?v={video_id}"
+            cache_subject = subject_for_video(video_id)
 
             yield _sse({
                 "step": 1,
@@ -834,34 +873,51 @@ async def analyze_video(request: AnalyzeRequest):
 
                 transcript_error = None
                 try:
-                    # Language preference for transcript tiers. `preferred_transcript_lang` was
-                    # already resolved once at YouTube-scope level above (user's explicit choice
-                    # wins, otherwise YouTube's declared audio language is used as a hint), so it
-                    # is intentionally NOT reassigned here — the Whisper fallback reads the same
-                    # scope-level value.
-                    task = asyncio.create_task(
-                        asyncio.to_thread(
-                            fetch_transcript,
-                            video_id,
-                            request.proxy,
-                            progress_callback,
-                            preferred_transcript_lang
+                    cached_lines = get_cached_transcript(cache_subject, cache_lang)
+                    if cached_lines:
+                        transcript_lines = cached_lines
+                        transcript_source = "cache"
+                        logger.info(
+                            f"Transcript cache hit for {cache_subject} (lang={cache_lang or 'auto'}): "
+                            f"{len(cached_lines)} lines — subtitle tiers and Whisper skipped"
                         )
-                    )
+                        yield _sse({
+                            "step": 3,
+                            "step_progress": 100,
+                            "overall_progress": 70,
+                            "stage": "Subtitles Ready",
+                            "detail": f"Transcript cache ditemukan — {len(cached_lines)} baris dipakai ulang (tanpa unduh audio / Whisper).",
+                            "message": f"Transcript dari cache — {len(cached_lines)} baris siap, langsung ke analisis AI."
+                        })
+                    else:
+                        # Language preference for transcript tiers. `preferred_transcript_lang` was
+                        # already resolved once at YouTube-scope level above (user's explicit choice
+                        # wins, otherwise YouTube's declared audio language is used as a hint), so it
+                        # is intentionally NOT reassigned here — the Whisper fallback reads the same
+                        # scope-level value.
+                        task = asyncio.create_task(
+                            asyncio.to_thread(
+                                fetch_transcript,
+                                video_id,
+                                request.proxy,
+                                progress_callback,
+                                preferred_transcript_lang
+                            )
+                        )
 
-                    while not task.done():
-                        try:
-                            evt = await asyncio.wait_for(progress_queue.get(), timeout=0.2)
-                            yield _sse(evt)
-                        except asyncio.TimeoutError:
-                            pass
+                        while not task.done():
+                            try:
+                                evt = await asyncio.wait_for(progress_queue.get(), timeout=0.2)
+                                yield _sse(evt)
+                            except asyncio.TimeoutError:
+                                pass
 
-                    while not progress_queue.empty():
-                        yield _sse(progress_queue.get_nowait())
+                        while not progress_queue.empty():
+                            yield _sse(progress_queue.get_nowait())
 
-                    transcript_lines = await task
-                    if not transcript_lines:
-                        transcript_error = RuntimeError("YouTube did not provide an accessible subtitle track.")
+                        transcript_lines = await task
+                        if not transcript_lines:
+                            transcript_error = RuntimeError("YouTube did not provide an accessible subtitle track.")
                 except Exception as e:
                     transcript_error = e
 
@@ -954,6 +1010,7 @@ async def analyze_video(request: AnalyzeRequest):
                             transcript_lines = await whisper_task
                             if not transcript_lines:
                                 raise RuntimeError("Local Whisper did not detect any speech in this video.")
+                            transcript_source = "whisper"
                             yield _sse({
                                 "step": 3, "step_progress": 100, "overall_progress": 70,
                                 "stage": "Subtitles Ready",
@@ -982,6 +1039,26 @@ async def analyze_video(request: AnalyzeRequest):
                         "detail": f"Subtitles loaded — {len(transcript_lines)} dialogue sentences with timestamps ready.",
                         "message": f"Subtitles loaded — {len(transcript_lines)} lines parsed successfully."
                     })
+
+        # ── Persist transcript so repeat runs skip subtitles/Whisper ────────────
+        # Stored AFTER the full transcript exists but BEFORE range slicing, so a
+        # later run with a different range still hits the cache. Mock data and
+        # user-supplied subtitles are never persisted.
+        if transcript_lines and not is_mock and not request.subtitles and transcript_source != "cache":
+            try:
+                save_cached_transcript(
+                    cache_subject,
+                    cache_lang,
+                    transcript_lines,
+                    source=transcript_source,
+                    duration=duration,
+                )
+                logger.info(
+                    f"Transcript cache saved: subject={cache_subject} lang={cache_lang or 'auto'} "
+                    f"source={transcript_source} lines={len(transcript_lines)}"
+                )
+            except Exception as cache_error:
+                logger.warning(f"Transcript cache save skipped: {cache_error}")
 
         # Estimate duration from transcript if missing
         if duration == 0.0 and transcript_lines:

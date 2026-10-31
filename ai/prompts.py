@@ -70,13 +70,47 @@ TITLE_ANGLES = (
 TITLE_CRITIC_DIMENSIONS = ("specificity", "curiosity", "clarity", "honesty")
 
 
+def _output_language_names(language: Any) -> tuple[str, str]:
+    """(Indonesian name, English name) of the requested OUTPUT language.
+
+    The prompts themselves are written in Indonesian with English fragments;
+    without an explicit rule the model copies that mix into the output
+    ("bahasa kecampur"). Naming the language twice covers both reading paths.
+    """
+    code = str(language or "").strip().lower()
+    if code.startswith("en"):
+        return "Inggris", "English"
+    if not code or code.startswith("id"):
+        return "Indonesia", "Indonesian"
+    return code, code
+
+
+def _output_language_rule(language: Any) -> str:
+    """The bullet that pins every output field to ONE language."""
+    id_name, en_name = _output_language_names(language)
+    rule = (
+        f"- BAHASA OUTPUT: tulis SEMUA field 100% dalam bahasa {id_name} ({en_name}). "
+        "Dilarang mencampur bahasa dalam satu kalimat atau satu pack; bahasa yang "
+        "dipakai di prompt ini BUKAN bahasa output. Hashtag, keyword, pinned "
+        "comment, dan thumbnail_text juga mengikuti bahasa output."
+    )
+    if str(language or "").strip().lower().startswith("en"):
+        rule += (
+            "\n- OUTPUT LANGUAGE: every field must be written entirely in English. "
+            "Do not use Indonesian words anywhere in the output."
+        )
+    return rule
+
+
 CAPTION_SYSTEM = (
     "Kamu adalah senior social-media copywriter dan YouTube copy strategist. Buat content pack yang "
     "spesifik terhadap isi transkrip, bukan template generik. Jangan membuat fakta yang tidak didukung. "
     "Setiap video punya transkripnya sendiri: judul, deskripsi, caption, dan hashtag harus lahir dari "
     "kata-kata di transkrip itu, dan tidak boleh memakai pola kalimat yang sama dengan video lain. "
-    "Judul wajib ditulis HURUF KAPITAL SEMUA (capslock), 3-6 kata, seperti judul Shorts yang layak "
-    "diklik: tanpa tanda kutip, tanpa emoji, tanpa titik di akhir, dan tetap jujur terhadap isi. "
+    "Judul wajib terasa ditulis manusia, bukan mesin: kapital natural seperti judul YouTube/Shorts "
+    "sungguhan (kata penting berawal kapital, kata sambung kecil tetap kecil) atau sentence case, 3-8 "
+    "kata, layak diklik, BUKAN HURUF KAPITAL SEMUA, tanpa tanda kutip, tanpa emoji, tanpa titik di "
+    "akhir, dan tetap jujur terhadap isi. "
     "Judul video asli / judul kerja dari renderer bukan judul final: jangan menyalin atau memparafrase "
     "judul itu, tulis judul baru dari isi transkrip. "
     "Setiap caption dan deskripsi wajib punya hook di kalimat pertama, isi spesifik di tengah, lalu CTA "
@@ -94,13 +128,20 @@ def caption_prompt(transcript: str, platform: str = "TikTok", tone: str = "casua
                    count: int = 5, style: str = "hooks", *, working_title: str = "",
                    avoid_titles: list[str] | None = None,
                    avoid_descriptions: list[str] | None = None,
-                   force_distinct: bool = False) -> str:
+                   force_distinct: bool = False,
+                   ai_title_suggestion: str = "",
+                   ai_caption_suggestion: str = "") -> str:
     """Prompt for ONE clip's content pack.
 
     ``working_title`` is the renderer/bot label the clip already carries (Auto
     Clip Studio title, Content Clipper AI export name, or the file name). It is
     handed over as context to be *replaced*, never as a title to reuse — feeding
     it as the "hook" was what made the AI echo ``menit 1 sampai 2`` back.
+
+    ``ai_title_suggestion``/``ai_caption_suggestion`` are different: they are the
+    analysis AI's OWN grounded copy for this clip, already written from the
+    transcript. They are offered as adoptable starting material (never as a
+    forbidden label), so a good suggestion is refined instead of discarded.
 
     ``avoid_titles``/``avoid_descriptions`` carry what earlier videos in the same
     batch already received, so a multi-video run cannot produce one description
@@ -115,6 +156,17 @@ def caption_prompt(transcript: str, platform: str = "TikTok", tone: str = "casua
         extras.append(
             "Judul kerja dari renderer/import (BUKAN judul final — dilarang dipakai "
             f"ulang apa adanya, tulis judul baru yang lebih kuat): {working[:160]}")
+    ai_title = str(ai_title_suggestion or "").strip()
+    ai_caption = str(ai_caption_suggestion or "").strip()
+    if ai_title or ai_caption:
+        lines = ["Saran dari AI analisis video ini (sudah ditulis dari transkrip — "
+                 "BOLEH dipakai atau diperbaiki, bukan wajib, tetap harus jujur "
+                 "terhadap isi dan ikut semua aturan di bawah):"]
+        if ai_title:
+            lines.append(f"- Saran judul: {ai_title[:160]}")
+        if ai_caption:
+            lines.append(f"- Saran caption: {ai_caption[:240]}")
+        extras.append("\n".join(lines))
     avoid_t = [str(t).strip() for t in (avoid_titles or []) if str(t).strip()][:8]
     if avoid_t:
         extras.append(
@@ -132,17 +184,18 @@ def caption_prompt(transcript: str, platform: str = "TikTok", tone: str = "casua
             "ini. Tulis ulang dengan struktur, kalimat pembuka, fokus, dan hashtag "
             "yang benar-benar berbeda.")
     extra_block = ("\n\n" + "\n\n".join(extras)) if extras else ""
+    id_name, en_name = _output_language_names(language)
     return f"""
 Buat content pack untuk potongan video/podcast berikut.
 
 Platform utama: {platform}
 Tone: {tone}
-Bahasa: {language}
+Bahasa output: {id_name} ({en_name})
 Jumlah opsi: {count}
 Style: {style}
 
 Kebutuhan OUTPUT:
-1. titles: {count} judul yang benar-benar berbeda, WAJIB HURUF KAPITAL SEMUA (capslock) dan 3-6 kata, tiap judul memakai sudut/angle yang BERBEDA (curiosity gap, hasil spesifik, how-to, angka, pertanyaan, kontrarian, cerita). Hindari judul generik seperti "rangkuman singkat". Ideal keep under {TITLE_MOBILE_CHARS} characters. Max {TITLE_MAX_CHARS}. Put the main subject/keyword in the first 3 words. The hook must be understandable at a glance on mobile.
+1. titles: {count} judul yang benar-benar berbeda dengan gaya kreator manusia (kapital natural seperti judul YouTube sungguhan, BUKAN KAPITAL SEMUA), 3-8 kata, tiap judul memakai sudut/angle yang BERBEDA (curiosity gap, hasil spesifik, how-to, angka, pertanyaan, kontrarian, cerita). Hindari judul generik seperti "rangkuman singkat". Ideal keep under {TITLE_MOBILE_CHARS} characters. Max {TITLE_MAX_CHARS}. Put the main subject/keyword in the first 3 words. The hook must be understandable at a glance on mobile.
 2. captions: {count} caption siap posting. Setiap caption: 1 kalimat hook, 1-2 kalimat isi, lalu 1 CTA (ajakan komentar/follow/tonton sampai habis).
 3. description_short: 2-4 kalimat, kalimat pertama hook dan kalimat terakhir CTA.
 4. description_long: deskripsi YouTube-style sekitar 250-450 kata, berisi pembuka hook yang menarik, konteks/topik, poin yang dibahas, dan CTA penutup (ajakan berdiskusi/follow). Jangan mengarang detail.
@@ -152,9 +205,10 @@ Kebutuhan OUTPUT:
 8. thumbnail_text: 4-6 opsi teks thumbnail pendek (2-6 kata, HURUF KAPITAL).
 
 Aturan:
+{_output_language_rule(language)}
 - Jangan membuat fakta, nama, angka, kutipan, atau kejadian yang tidak ada di transkrip/konteks.
 - Jangan menjanjikan virality.
-- Judul WAJIB huruf kapital semua (contoh bentuk: "GOL PENALTI DETIK AKHIR PECAHKAN STADION"), tanpa tanda kutip, tanpa emoji, tanpa titik di akhir. Jangan pakai Title Case atau huruf kecil.
+- Judul ditulis seperti manusia asli, bukan bot: kapital natural ala judul YouTube (contoh: "Penalti Detik Akhir Pecahkan Stadion"), JANGAN huruf kapital semua dan jangan pola template kaku; tanpa tanda kutip, tanpa emoji, tanpa titik di akhir.
 - Panjang judul: ideal <= {TITLE_MOBILE_CHARS} karakter, keras maksimal {TITLE_MAX_CHARS} karakter. Assume phones cut after ~{TITLE_MOBILE_CHARS} characters. The reason to click must be visible in the first {TITLE_MOBILE_CHARS}. Kalau harus memotong, buang kata sambung — jangan buang informasi.
 - Kalau ada beberapa judul, jangan buat variasi kata dari satu ide yang sama: pakai sudut yang benar-benar berbeda (pertanyaan, angka, how-to, kontrarian, hasil spesifik, cerita).
 - Dilarang memakai judul kerja / judul video asli di atas sebagai judul final: jangan menyalin dan jangan memparafrase. Setiap judul harus jelas lahir dari isi transkrip ini saja.
@@ -173,7 +227,7 @@ Transkrip/konteks:
 
 Format JSON:
 {{
-  "titles": ["JUDUL KAPITAL SEMUA 3-6 KATA"],
+  "titles": ["Judul Natural Seperti Kreator Asli"],
   "captions": ["..."],
   "description_short": "...",
   "description_long": "...",
@@ -191,8 +245,9 @@ TITLE_BRAINSTORM_SYSTEM = (
     "Kamu adalah editor YouTube Shorts yang menulis judul untuk dibaca di layar HP. "
     "Tulis BANYAK kandidat lebih dulu, jangan langsung memilih satu. Setiap kandidat harus lahir "
     "dari isi transkrip yang diberikan, bukan dari judul video asli. Jangan membuat fakta, angka, "
-    "nama, atau kutipan yang tidak ada di transkrip. Judul wajib HURUF KAPITAL SEMUA, 3-6 kata, "
-    "tanpa tanda kutip, tanpa emoji, tanpa titik di akhir. Jawab HANYA JSON valid."
+    "nama, atau kutipan yang tidak ada di transkrip. Judul wajib bergaya kreator manusia: kapital "
+    "natural seperti judul YouTube sungguhan (BUKAN HURUF KAPITAL SEMUA), 3-8 kata, tanpa tanda "
+    "kutip, tanpa emoji, tanpa titik di akhir. Jawab HANYA JSON valid."
 )
 
 
@@ -226,6 +281,13 @@ def title_brainstorm_prompt(text: str, *, language: str = "id",
             "Judul yang SUDAH dipakai video lain di batch ini — wajib berbeda kata "
             "dan sudut pandang:\n" + "\n".join(f"  - {t[:160]}" for t in avoid))
     extra_block = ("\n" + "\n".join(f"- {line}" for line in extras)) if extras else ""
+    id_name, en_name = _output_language_names(language)
+    lang_bullet = (
+        f"- Tulis semua kandidat judul dalam bahasa {id_name} ({en_name}) saja — "
+        "dilarang mencampur bahasa di dalam satu judul."
+    )
+    if str(language or "").strip().lower().startswith("en"):
+        lang_bullet += " Every title must be entirely in English."
     return f"""
 Transkrip potongan ini (bahasa: {language}):
 {str(text or '')[:8000]}
@@ -237,11 +299,13 @@ Tugas TAHAP 1 — BRAINSTORM JUDUL:
 - Panjang: ideal <= {TITLE_MOBILE_CHARS} karakter, keras maksimal {TITLE_MAX_CHARS} karakter.
 - Letakkan subjek/kata kunci utama di 3 kata pertama.
 - Assume phones cut after ~{TITLE_MOBILE_CHARS} characters. The reason to click must be visible in the first {TITLE_MOBILE_CHARS}.
+- Gaya judul seperti kreator manusia asli: kapital natural ala judul YouTube, BUKAN huruf kapital semua, bukan template kaku.
 - Judul harus bisa dipahami sekilas di layar HP (clarity), spesifik (bukan "rangkuman singkat"), dan jujur terhadap isi transkrip.
-- Setiap kandidat memakai kata-kata yang benar-benar ada di transkrip di atas.{extra_block}
+- Setiap kandidat memakai kata-kata yang benar-benar ada di transkrip di atas.
+{lang_bullet}{extra_block}
 
 Format JSON:
-{{"candidates": [{{"title": "JUDUL KAPITAL 3-6 KATA", "angle": "curiosity gap", "why": "alasan singkat"}}]}}
+{{"candidates": [{{"title": "Judul natural 3-8 kata", "angle": "curiosity gap", "why": "alasan singkat"}}]}}
 
 Jawab HANYA JSON, tanpa markdown.
 """.strip()
@@ -278,7 +342,7 @@ Tugas TAHAP 2 — NILAI KANDIDAT JUDUL:
 - Lalu pilih maksimal {count} kandidat terbaik yang sudutnya BERBEDA satu sama lain (bukan variasi kata dari ide yang sama).
 
 Format JSON:
-{{"scores": [{{"title": "JUDUL PERSIS SEPERTI DI ATAS", "angle": "curiosity gap", "specificity": 8, "curiosity": 7, "clarity": 9, "honesty": 10, "note": "catatan singkat"}}], "top": ["JUDUL TERBAIK 1", "JUDUL TERBAIK 2"]}}
+{{"scores": [{{"title": "Judul persis seperti di daftar di atas", "angle": "curiosity gap", "specificity": 8, "curiosity": 7, "clarity": 9, "honesty": 10, "note": "catatan singkat"}}], "top": ["Judul terbaik 1", "Judul terbaik 2"]}}
 
 Jawab HANYA JSON, tanpa markdown.
 """.strip()

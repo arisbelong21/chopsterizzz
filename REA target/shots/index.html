@@ -1,0 +1,67 @@
+<!DOCTYPE html>
+<html lang="id">
+<head>
+<meta charset="utf-8">
+<title>igloo.inc — capture frames (REA)</title>
+<style>
+  :root { color-scheme: dark; }
+  body { margin:0; background:#0e1014; color:#e8ebf0; font:14px/1.5 ui-monospace, "IBM Plex Mono", Consolas, monospace; }
+  header { padding:28px 32px 8px; }
+  h1 { font-size:18px; margin:0 0 6px; font-weight:600; letter-spacing:.02em; }
+  p.meta { margin:0; color:#8b93a1; font-size:12.5px; }
+  .grid { display:grid; grid-template-columns:repeat(auto-fill,minmax(360px,1fr)); gap:18px; padding:24px 32px 48px; }
+  figure { margin:0; background:#161a21; border:1px solid #232833; border-radius:10px; overflow:hidden; }
+  figure img { display:block; width:100%; height:auto; }
+  figcaption { padding:9px 12px; font-size:12px; color:#9aa3b2; border-top:1px solid #232833; }
+  figcaption b { color:#e8ebf0; font-weight:600; }
+  .flag { color:#ffb454; }
+</style>
+</head>
+<body>
+<header>
+  <h1>www.igloo.inc — frame capture via REA (Chromium 156, GPU nyata)</h1>
+  <p class="meta">
+    13 frame dari skenario scroll (PageDown × 5) + 1 frame setelah klik = masuk mode explore.
+    Diambil melalui <code>capture_browser_scenario</code>; file di-decode dari Evidence bundle resmi REA.
+  </p>
+</header>
+<div class="grid">
+
+  <figure><img src="00-scenario_start.png" alt="start"><figcaption><b>00</b> — sebelum navigasi. Warna solid: ini <i>curtain</i> preloader (1 warna, 6,9 KB).</figcaption></figure>
+
+  <figure><img src="01-load.png" alt="load"><figcaption><b>01</b> — <code>load</code> selesai, WebGL belum jalan. Masih curtain. Bukti tidak ada flash canvas kosong.</figcaption></figure>
+
+  <figure><img src="02-settle.png" alt="settle"><figcaption><b>02</b> — scene pertama tampil (670 warna, 1,66 MB). Semua ~98 aset sudah masuk di titik ini.</figcaption></figure>
+
+  <figure><img src="03-a1.png" alt="a1"><figcaption><b>03</b> — PageDown pertama.</figcaption></figure>
+
+  <figure><img src="04-w1.png" alt="w1"><figcaption><b>04</b> — setelah transisi.</figcaption></figure>
+
+  <figure><img src="05-a2.png" alt="a2"><figcaption><b>05</b> — PageDown kedua.</figcaption></figure>
+
+  <figure><img src="06-w2.png" alt="w2"><figcaption><b>06</b> — transisi selesai. Ukuran turun (1,41 MB) = adegan jadi lebih sederhana/datar.</figcaption></figure>
+
+  <figure><img src="07-a3.png" alt="a3"><figcaption><b>07</b> — PageDown ketiga.</figcaption></figure>
+
+  <figure><img src="08-w3.png" alt="w3"><figcaption><b>08</b> — transisi selesai.</figcaption></figure>
+
+  <figure><img src="09-a4.png" alt="a4"><figcaption><b>09</b> — PageDown keempat.</figcaption></figure>
+
+  <figure><img src="10-w4.png" alt="w4"><figcaption><b>10</b> — transisi selesai.</figcaption></figure>
+
+  <figure><img src="11-a5.png" alt="a5"><figcaption><b>11</b> — PageDown kelima.</figcaption></figure>
+
+  <figure><img src="12-w5.png" alt="w5"><figcaption><b>12</b> — state terakhir sebelum interaksi. Baseline untuk perbandingan.</figcaption></figure>
+
+  <figure>
+    <img src="explore-mode.png" alt="explore">
+    <figcaption>
+      <b class="flag">EXPLORE</b> — setelah klik di <code>body</code>.
+      Luminance 137,5 → 149,5; kompleksitas warna 665 → 941; 60,8% piksel berubah.
+      <b>Objek baru muncul</b> dan tidak ada request jaringan baru → semua sudah di-preload.
+    </figcaption>
+  </figure>
+
+</div>
+</body>
+</html>

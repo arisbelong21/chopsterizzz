@@ -80,7 +80,7 @@ _CRITIC_REPLY = json.dumps({"scores": [
      "specificity": 8, "curiosity": 8, "clarity": 8, "honesty": 8},
 ], "top": ["PENALTI DETIK AKHIR PECAHKAN STADION"]})
 
-_WINNER = "PENALTI DETIK AKHIR PECAHKAN STADION"
+_WINNER = "Penalti Detik Akhir Pecahkan Stadion"
 
 #: "0:00 Intro", "1:20 Babak kedua", ... - the shape YouTube needs.
 _CHAPTER_LINE_RE = re.compile(r"^\d{1,2}:\d{2} \S", re.MULTILINE)
@@ -157,7 +157,7 @@ class AutomationUploadHookTests(unittest.TestCase):
         self.assertEqual(pack["title_source"], "brainstorm-critic")
         self.assertEqual(pack["titles"][0], _WINNER)
         # The single-shot titles stay visible as the other options.
-        self.assertIn("PENALTI DETIK AKHIR", pack["titles"])
+        self.assertIn("Penalti Detik Akhir", pack["titles"])
 
     def test_youtube_payload_uploads_the_curated_title(self):
         pack, _orch = _automation_pack()

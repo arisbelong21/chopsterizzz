@@ -1216,6 +1216,28 @@ class AutomationPage(QWidget):
             pack_card, muted=True))
         model_row.addStretch()
         pack_card.layout().addLayout(model_row)
+        lang_row = QHBoxLayout()
+        lang_row.addWidget(self._lbl("Bahasa judul/deskripsi", pack_card, muted=True))
+        self.pack_lang_combo = QComboBox(pack_card)
+        for _lbl_lang, _val_lang in (("Ikuti bahasa video (deteksi otomatis)", "auto"),
+                                     ("Indonesia", "id"),
+                                     ("English (Inggris)", "en")):
+            self.pack_lang_combo.addItem(_lbl_lang, _val_lang)
+        _saved_lang = ""
+        try:
+            _saved_lang = str(self.app.config.get("aut_pack_language") or "auto").strip().lower()
+        except Exception:
+            _saved_lang = "auto"
+        _idx_lang = self.pack_lang_combo.findData(_saved_lang if _saved_lang in ("auto", "id", "en") else "auto")
+        self.pack_lang_combo.setCurrentIndex(max(0, _idx_lang))
+        self.pack_lang_combo.currentIndexChanged.connect(self._save_pack_lang)
+        lang_row.addWidget(self.pack_lang_combo)
+        lang_row.addWidget(self._lbl(
+            "«Ikuti bahasa video» memakai bahasa yang terdeteksi dari transkrip clip "
+            "ini, jadi video Inggris mendapat judul/deskripsi Inggris.",
+            pack_card, muted=True))
+        lang_row.addStretch()
+        pack_card.layout().addLayout(lang_row)
         form = QVBoxLayout()
         form.addWidget(self._lbl("Title", pack_card, muted=True))
         self.title_combo = QComboBox(pack_card)
@@ -1490,15 +1512,37 @@ class AutomationPage(QWidget):
         self._wizard_step(0)
 
     def _pack_language(self, ctx) -> str:
-        """Content-pack language from the template choice; "auto" = follow video."""
+        """Content-pack language from the Create-tab choice; "auto" = follow video.
+
+        ``auto`` resolves to the clip's stored language, or a fresh detection
+        from the clip's own transcript — an English video therefore gets an
+        English pack instead of silently falling back to Indonesian.
+        """
         try:
-            choice = str(self.template_lang.currentData() or "id").strip().lower()
+            choice = str(self.pack_lang_combo.currentData() or "auto").strip().lower()
         except Exception:
-            choice = "id"
-        if choice in ("auto", "video", "follow"):
-            lang = str(getattr(ctx, "language", "") or "").strip().lower()
-            return lang if lang and lang != "auto" else "id"
-        return choice or "id"
+            choice = "auto"
+        if choice not in ("auto", "video", "follow", "id", "en"):
+            choice = "auto"
+        from chopster.automation.context import resolve_pack_language
+        return resolve_pack_language(ctx, choice)
+
+    def _save_pack_lang(self, _index: int = 0) -> None:
+        """Persist the Create-tab metadata language choice."""
+        try:
+            value = str(self.pack_lang_combo.currentData() or "auto").strip().lower()
+        except Exception:
+            return
+        if value not in ("auto", "id", "en"):
+            return
+        try:
+            config = self.app.config
+            if hasattr(config, "update"):
+                config.update({"aut_pack_language": value})
+            else:
+                config.set("aut_pack_language", value)
+        except Exception:
+            return
 
     def _selected_media(self) -> list[dict]:
         out = []
@@ -1737,13 +1781,30 @@ class AutomationPage(QWidget):
         from copy import deepcopy
         transcript = getattr(clipper, "transcript", None) if clipper else None
         tr = deepcopy(transcript) if transcript is not None else None
+        from chopster.automation.content import primary_platform
+        from chopster.automation.context import resolve_pack_language
+        plat = primary_platform(self._selected_platforms())
+
+        class _TranscriptCtx:
+            """Minimal ctx so the shared language resolver can read a Transcript."""
+            def __init__(self, tr):
+                self.language = str(getattr(tr, "language", "") or "")
+                self.title = ""
+                self.segments = [{"text": str(s.text or "")}
+                                 for s in (getattr(tr, "segments", []) or [])]
+
+        try:
+            fb_choice = str(self.pack_lang_combo.currentData() or "auto").strip().lower()
+        except Exception:
+            fb_choice = "auto"
+        lang_fb = resolve_pack_language(_TranscriptCtx(tr), fb_choice)
 
         def worker(*, signals, cancel_check):
             signals.progress.emit("automation:pack", 20, "Content Pack: menyusun judul + deskripsi + hashtag…")
             from chopster.clipper.caption_generator import generate_captions
             # No clip evidence on this path: the Content Clipper transcript is
             # the only input (the user confirmed that above).
-            return generate_captions(tr, cfg, platform="youtube", language="id", count=5, style="hooks")
+            return generate_captions(tr, cfg, platform=plat, language=lang_fb, count=5, style="hooks")
 
         def done(result):
             self._pack_running(False)
@@ -1793,7 +1854,7 @@ class AutomationPage(QWidget):
         and regenerated once when a description repeats (spec 6.6).
         """
         from chopster.automation.context import caption_context, focused_transcript
-        from chopster.automation.content import pack_signature
+        from chopster.automation.content import pack_signature, primary_platform
         from chopster.automation.local_transcribe import (
             media_context_from_file,
             pack_whisper_model,
@@ -1804,6 +1865,7 @@ class AutomationPage(QWidget):
             cfg_base = {}
         from copy import deepcopy
         n_total = max(1, len(targets))
+        plat = primary_platform(self._selected_platforms())
         primary_path = str(targets[0].get("path") or "")
         binding = str(getattr(targets[0].get("ctx"), "source_asset_id", "") or "")
         model = pack_whisper_model(self.app.config)
@@ -1856,14 +1918,14 @@ class AutomationPage(QWidget):
                     focus = focused_transcript(ctx)
                     if focus is None or not getattr(focus, "segments", None):
                         raise RuntimeError("transkrip video ini kosong")
-                    pack = generate_captions(focus, cfg2, platform="youtube",
+                    pack = generate_captions(focus, cfg2, platform=plat,
                                              language=pack_lang, count=5, style="hooks")
                     signature = pack_signature(pack)[0]
                     if signature and signature in used_descriptions:
                         # Same words for a different video: regenerate once with
                         # an explicit instruction, then report it honestly.
                         cfg2["force_distinct"] = True
-                        retry = generate_captions(focus, cfg2, platform="youtube",
+                        retry = generate_captions(focus, cfg2, platform=plat,
                                                   language=pack_lang, count=5, style="hooks")
                         retry_sig = pack_signature(retry)[0]
                         if (isinstance(retry, dict) and (retry.get("title") or retry.get("titles"))

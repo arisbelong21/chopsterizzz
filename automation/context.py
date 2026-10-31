@@ -112,6 +112,12 @@ class ClipContext:
     clip_end: float = 0.0
     evidence: str = ""
     segments: list[dict[str, Any]] = field(default_factory=list)
+    #: The analysis AI's own grounded suggestions for this clip. Unlike the
+    #: renderer/import ``title`` (a label to REPLACE), these are real copy the
+    #: video AI already wrote from the transcript, so publish keeps them as
+    #: candidate material instead of throwing them away (spec §8.2).
+    ai_title_suggestion: str = ""
+    ai_caption_suggestion: str = ""
 
     @property
     def has_transcript(self) -> bool:
@@ -137,6 +143,8 @@ class ClipContext:
             "clip_end": round(float(self.clip_end), 3),
             "evidence": self.evidence,
             "segments": [dict(s) for s in self.segments],
+            "ai_title_suggestion": self.ai_title_suggestion,
+            "ai_caption_suggestion": self.ai_caption_suggestion,
         }
 
     @staticmethod
@@ -156,6 +164,8 @@ class ClipContext:
             clip_end=_to_float(data.get("clip_end")),
             evidence=str(data.get("evidence") or ""),
             segments=normalize_segments(data.get("segments")),
+            ai_title_suggestion=str(data.get("ai_title_suggestion") or ""),
+            ai_caption_suggestion=str(data.get("ai_caption_suggestion") or ""),
         )
 
 
@@ -163,7 +173,8 @@ def build_clip_context(*, source: str = "manual", source_asset_id: str = "",
                        project_id: str = "", media_path: str = "", title: str = "",
                        language: str = "id", clip_start: Any = None,
                        clip_end: Any = None, segments: Any = None,
-                       evidence: str = "") -> ClipContext:
+                       evidence: str = "", ai_title_suggestion: str = "",
+                       ai_caption_suggestion: str = "") -> ClipContext:
     """Build a context from real evidence only (empty when nothing is provable)."""
     ctx = ClipContext(
         source=(source or "manual").lower() if (source or "").lower() in SOURCES else "manual",
@@ -176,6 +187,8 @@ def build_clip_context(*, source: str = "manual", source_asset_id: str = "",
         clip_end=_to_float(clip_end),
         evidence=str(evidence or ""),
         segments=normalize_segments(segments),
+        ai_title_suggestion=str(ai_title_suggestion or ""),
+        ai_caption_suggestion=str(ai_caption_suggestion or ""),
     )
     if ctx.clip_end and ctx.clip_end > ctx.clip_start:
         ctx.segments = window_segments(ctx.segments, ctx.clip_start, ctx.clip_end)
@@ -227,6 +240,47 @@ def segments_from_words(words: Any, gap: float = 0.7) -> list[dict[str, Any]]:
     return out
 
 
+def detect_context_language(ctx: Any) -> str:
+    """The clip's spoken language from its OWN transcript, or ``"auto"``.
+
+    Shared by the template publish path and the Studio Create tab so "follow
+    the video language" never silently falls back to Indonesian when a clip's
+    stored ``language`` is still the literal ``"auto"``.
+    """
+    try:
+        from chopster.auto_clip_studio.engine.utils import detect_transcript_language
+    except Exception:
+        return "auto"
+    segments = list(getattr(ctx, "segments", []) or [])
+    lines = [{"text": str(s.get("text") or "")}
+             for s in segments if isinstance(s, dict)]
+    if not lines:
+        return "auto"
+    title = str(getattr(ctx, "title", "") or "")
+    try:
+        detected = detect_transcript_language(lines, title)
+    except Exception:
+        return "auto"
+    code = str((detected or {}).get("code") or "").strip().lower()
+    return code or "auto"
+
+
+def resolve_pack_language(ctx: Any, choice: str) -> str:
+    """Map a UI language choice (``id``/``en``/``auto``) to a concrete code.
+
+    ``auto`` follows the clip: its stored language first, then a fresh
+    detection from the clip's own transcript, and only then Indonesian.
+    """
+    pref = str(choice or "").strip().lower() or "auto"
+    if pref not in ("auto", "video", "follow"):
+        return pref
+    lang = str(getattr(ctx, "language", "") or "").strip().lower()
+    if lang and lang != "auto":
+        return lang
+    detected = detect_context_language(ctx)
+    return detected if detected and detected != "auto" else "id"
+
+
 def context_status(ctx: ClipContext | None) -> tuple[bool, str]:
     """Is the context strong enough to generate honest metadata?"""
     if ctx is None:
@@ -260,7 +314,7 @@ def caption_context(ctx: ClipContext) -> dict[str, Any]:
     end = ctx.clip_end or float(ctx.segments[-1]["end"])
     rows = ctx.window()
     excerpt = _clip_excerpt(rows, 1500)
-    return {
+    context: dict[str, Any] = {
         "highlight_context": [{
             "start": round(start, 3),
             "end": round(end, 3),
@@ -271,6 +325,13 @@ def caption_context(ctx: ClipContext) -> dict[str, Any]:
         }],
         "clip_context": ctx.to_dict(),
     }
+    # Hand the video AI's own grounded copy forward as adoptable suggestions, so
+    # a real title/caption it wrote is never discarded at publish time.
+    if str(ctx.ai_title_suggestion or "").strip():
+        context["ai_title_suggestion"] = str(ctx.ai_title_suggestion).strip()
+    if str(ctx.ai_caption_suggestion or "").strip():
+        context["ai_caption_suggestion"] = str(ctx.ai_caption_suggestion).strip()
+    return context
 
 
 def same_asset(ctx: ClipContext | None, *, media_path: str = "", source_path: str = "") -> bool:
